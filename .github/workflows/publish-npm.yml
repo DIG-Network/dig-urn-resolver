@@ -3,25 +3,33 @@ name: publish-npm
 # Publish the resolver WASM as @dignetwork/dig-urn-resolver. Assembles a DUAL-TARGET
 # package (wasm-bindgen `web` ESM + `nodejs` CommonJS) via scripts/build-npm.mjs, so
 # it imports cleanly in BOTH a browser bundler (Vite/webpack) AND a Node.js service,
-# then publishes the assembled ./pkg. Auth uses the org-level NPM_TOKEN secret (public
-# repo). Runs when a GitHub Release is published (the release.yml tag → release), or on
-# manual dispatch. Mirrors digstore's publish-npm.yml.
+# then publishes the assembled ./pkg.
+#
+# Auth = npm OIDC TRUSTED PUBLISHING (no token, no OTP). npmjs is configured with a
+# trusted publisher for repo DIG-Network/dig-urn-resolver + workflow publish-npm.yml;
+# with `id-token: write` + npm >= 11.5.1, `npm publish` mints a short-lived OIDC token
+# automatically and publishes with provenance. This replaces the NPM_TOKEN path, which
+# failed with EOTP because the npm account has 2FA (CI cannot supply a one-time password).
+#
+# Triggers: the release.yml tag push (`v*`, pushed with RELEASE_TOKEN so it fires
+# downstream workflows), or a manual dispatch for re-runs/repairs.
 on:
-  release:
-    types: [published]
+  push:
+    tags:
+      - "v*"
   workflow_dispatch: {}
 
 concurrency:
   group: npm-publish
   cancel-in-progress: false
 
-permissions:
-  contents: read
-
 jobs:
   publish:
     name: build wasm + npm publish
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # mint the OIDC token npm trades for a publish credential
     steps:
       - uses: actions/checkout@v4
         with:
@@ -39,10 +47,14 @@ jobs:
           node-version: 20
           registry-url: "https://registry.npmjs.org"
 
+      # OIDC trusted publishing requires npm >= 11.5.1; node 20 ships an older npm.
+      - name: Upgrade npm to a version that supports OIDC trusted publishing
+        run: npm install -g npm@latest
+
       - name: Assemble the dual-target package (web + node)
         run: node scripts/build-npm.mjs
 
-      - name: Publish to npmjs
+      # No NODE_AUTH_TOKEN: with id-token:write + the configured trusted publisher,
+      # npm authenticates via OIDC and auto-enables provenance.
+      - name: Publish to npmjs (OIDC trusted publishing)
         run: npm publish ./pkg --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
