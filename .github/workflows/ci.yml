@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test Suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      # Lint the native build (default features)...
+      - name: Clippy (native)
+        run: cargo clippy --all-targets --features native -- -D warnings
+
+      # ...and the wasm build (the wasm-bindgen surface + fetch transport).
+      - name: Clippy (wasm)
+        run: cargo clippy --lib --target wasm32-unknown-unknown --no-default-features --features wasm -- -D warnings
+
+      - name: Run tests (nextest, flaky-aware)
+        run: cargo nextest run --features native --retries 2 --test-threads=1
+
+      - name: Check documentation
+        run: cargo doc --no-deps --features native
+
+  coverage:
+    name: Coverage (>=80% lines, gated)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: llvm-tools-preview
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      # `native` + `wasm` glue (reqwest / browser fetch) are thin I/O adapters
+      # exercised by integration/e2e, not unit tests; the gate measures the pure
+      # protocol logic (resolver, ladder, rpc, node, crypto, urn, content_type,
+      # pages). Enforced by `--fail-under-lines 80`.
+      - name: Run coverage with 80% line gate
+        run: >
+          cargo llvm-cov nextest --features native
+          --ignore-filename-regex '(native|wasm)\.rs$'
+          --fail-under-lines 80 --retries 2 --test-threads 1
+
+  wasm-build:
+    name: wasm-pack build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # Prove the crate is wasm-CLEAN: a full wasm32 compile with digstore-core
+      # default-features=false must succeed with no getrandom/blst leaks.
+      - name: Build wasm32 (wasm-clean check)
+        run: cargo build --target wasm32-unknown-unknown --no-default-features --features wasm
+
+      # Assemble the DUAL-TARGET npm package (web + node) and smoke-test that the
+      # Node entry loads (require + version()).
+      - name: Build the dual-target npm package
+        run: node scripts/build-npm.mjs
+
+      - name: Smoke-test the Node build loads
+        run: node -e "const m=require('./pkg'); if(typeof m.version!=='function'||typeof m.DigNetwork!=='function') throw new Error('node build missing API'); console.log('node build ok', m.version())"

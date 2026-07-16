@@ -1,0 +1,12 @@
+<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512' width='512' height='512' role='img' aria-label='DIG Network: Something went wrong'>
+  <defs><radialGradient id='bg' cx='50%' cy='0%' r='120%'>
+    <stop offset='0%' stop-color='#141a2e'/><stop offset='60%' stop-color='#0a0f1e'/><stop offset='100%' stop-color='#070a14'/>
+  </radialGradient></defs>
+  <rect width='512' height='512' fill='url(#bg)'/>
+  <circle cx='256' cy='190' r='68' fill='none' stroke='#7f8db3' stroke-width='8'/>
+  <text x='256' y='226' text-anchor='middle' font-family='-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif' font-size='84' font-weight='700' fill='#7f8db3'>!</text>
+  <text x='256' y='320' text-anchor='middle' font-family='-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif' font-size='40' font-weight='700' fill='#ffffff'>Something went wrong</text>
+  
+  <text x='256' y='452' text-anchor='middle' font-family='-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif' font-size='22' font-weight='700' letter-spacing='6' fill='#7f8db3'>DIG NETWORK</text>
+  <text x='256' y='478' text-anchor='middle' font-family='-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif' font-size='16' letter-spacing='2' fill='#7f8db3'>dig.net</text>
+</svg>
