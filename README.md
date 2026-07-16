@@ -16,14 +16,29 @@ first tier that responds:
 
 - **node tier** — `GET /s/<storeId>[:<root>]/<path>`: a local dig-node decrypts +
   verifies server-side under a loopback trust boundary and returns plaintext.
-- **rpc tier** — `dig.getAnchoredRoot` + `dig.getContent`: a *blind* fetch of opaque
-  ciphertext + inclusion proofs from the public gateway, verified against the
-  chain-anchored root and decrypted **client-side** (fail-closed).
+- **rpc tier** — `dig.getContent`: a *blind* fetch of opaque ciphertext + inclusion
+  proofs from the untrusted public gateway, verified against the chain-anchored root
+  and decrypted **client-side** (fail-closed).
 
 All read-crypto (URN canonicalization + retrieval-key derivation, merkle inclusion
 verify, AES-256-GCM-SIV open) is reused verbatim from `digstore-core` — the same
 functions the browser read-crypto and the on-chain crates share — so this crate can
 never skew from the canonical crypto.
+
+## Security invariants
+
+- **Node trust is loopback-only.** The crypto-free node `/s/` path is trusted ONLY
+  for an asserted-loopback host (`127.0.0.0/8` / `::1` / `localhost`, or `dig.local`
+  iff it resolves to loopback) — it is the user's own machine. ANY other host,
+  including an explicit override pointed at a remote host, uses the client-VERIFIED
+  rpc path. On the node path the response MUST carry `X-Dig-Verified: true`, else the
+  bytes are rejected fail-closed. (Defeats a remote/override host and a LAN mDNS
+  spoof of `.local` serving unverified bytes as trusted.)
+- **The rpc trust root comes from the URN, not the gateway.** Over the untrusted
+  gateway only a **root-pinned** URN is accepted; a rootless URN is rejected
+  (`RootRequired`) because its root would otherwise come from the same gateway
+  serving the content. (Rootless is fine over a loopback node — the local node is the
+  trust anchor. Root-pinned + private/salted stores are unaffected.)
 
 ## Three outcomes, never conflated
 
@@ -55,20 +70,25 @@ Inject a custom transport (or an explicit endpoint) via `Resolver::with_options`
 
 ## Browser / Sage (`@dignetwork/dig-urn-resolver`)
 
+The front-door API is the branded, well-typed **`DigNetwork`** client:
+
 ```js
-import init, { resolve, resolveObjectUrl } from "@dignetwork/dig-urn-resolver";
+import init, { DigNetwork } from "@dignetwork/dig-urn-resolver";
 await init();
 
+const dig = new DigNetwork();               // or: new DigNetwork(endpoint, connectUrl)
+
 // The NFT-image case — a blob: URL for <img src>, working with no dig-node running:
-img.src = await resolveObjectUrl(nftDataUri);
+img.src = await dig.resolveImageUrl(nftDataUri);
 
 // Or the typed form:
-const { outcome, bytes, contentType } = await resolve(nftDataUri);
+const { outcome, bytes, contentType } = await dig.resolve(nftDataUri);
 // outcome ∈ "success" | "integrity_failure" | "unreachable"
 ```
 
-On an integrity failure, `resolveObjectUrl` returns the security page — **never** the
-unverified bytes as an image.
+On an integrity failure, `resolveImageUrl` returns the branded security page —
+**never** the unverified bytes as an image. Low-level free functions (`resolve`,
+`resolveObjectUrl`) remain available for callers that prefer them.
 
 ### CORS note for consuming apps (Sage/Tauri)
 

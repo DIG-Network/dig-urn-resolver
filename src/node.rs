@@ -2,9 +2,15 @@
 //!
 //! A dig-node decrypts + verifies server-side on the same machine and returns
 //! PLAINTEXT under a loopback trust boundary, so there is no client-side crypto
-//! here: the resolver trusts the node's `X-Dig-Verified` result (the node is the
-//! user's own process). This is why the node tier is preferred — it is both faster
-//! and does no in-browser crypto.
+//! here. Two conditions make that trust sound, and BOTH are enforced:
+//!
+//! 1. **Loopback only** — this path is reached ONLY for an asserted-loopback host
+//!    (the ladder's [`crate::ladder::classify`] guard); a remote/override host is
+//!    routed to the client-verified rpc path instead.
+//! 2. **The node asserted it verified** — the response MUST carry
+//!    `X-Dig-Verified: true`. A missing/false header means the node did NOT verify
+//!    the bytes against the chain-anchored root, so they are rejected fail-closed
+//!    (never returned as content).
 
 use crate::content_type;
 use crate::error::{ResolveError, Result};
@@ -22,10 +28,11 @@ fn serve_url(base: &str, parsed: &ParsedUrn) -> String {
     format!("{base}/s/{store}/{}", parsed.resource_key())
 }
 
-/// Fetch a resource from a dig-node. Returns decrypted bytes + content type. A
-/// `404` is a fail-closed [`ResolveError::NotFound`]; a transport failure (or any
-/// other non-2xx, e.g. the node erroring mid-request) is
-/// [`ResolveError::Transport`] so the ladder can fall through.
+/// Fetch a resource from a loopback dig-node. Returns decrypted bytes + content
+/// type. A `404` is a fail-closed [`ResolveError::NotFound`]; a transport failure
+/// (or any other non-2xx) is [`ResolveError::Transport`] so the ladder can fall
+/// through. Bytes served WITHOUT `X-Dig-Verified: true` are rejected fail-closed as
+/// [`ResolveError::VerifyFailed`] — the node did not attest verification.
 pub async fn fetch<T: HttpTransport + ?Sized>(
     transport: &T,
     base: &str,
@@ -45,6 +52,18 @@ pub async fn fetch<T: HttpTransport + ?Sized>(
             "node returned HTTP {}",
             resp.status
         )));
+    }
+
+    // Require the node's verification attestation. Absent/false ⇒ the node did not
+    // verify the bytes against the chain-anchored root → fail closed.
+    let verified = resp
+        .header("x-dig-verified")
+        .map(|v| v.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !verified {
+        return Err(ResolveError::VerifyFailed(
+            "node did not assert X-Dig-Verified: true".into(),
+        ));
     }
 
     // The node already knows the type; prefer its header, else derive from the path.

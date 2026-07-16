@@ -8,9 +8,10 @@
 //! webview, the wasm helper:
 //!
 //! ```js
-//! import init, { resolveObjectUrl } from "@dignetwork/dig-urn-resolver";
+//! import init, { DigNetwork } from "@dignetwork/dig-urn-resolver";
 //! await init();
-//! img.src = await resolveObjectUrl(nftDataUri); // works node-absent (rpc fallback)
+//! const dig = new DigNetwork();
+//! img.src = await dig.resolveImageUrl(nftDataUri); // works node-absent (rpc fallback)
 //! ```
 
 use async_trait::async_trait;
@@ -88,7 +89,7 @@ async fn main() {
                 data.content_type
             );
             assert_eq!(data.bytes, PNG);
-            println!("  → wasm resolveObjectUrl(urn) would wrap these bytes in a blob: URL for <img src>.");
+            println!("  → wasm DigNetwork.resolveImageUrl(urn) would wrap these bytes in a blob: URL for <img src>.");
         }
         Ok(other) => panic!("expected the image to resolve, got {other:?}"),
         Err(e) => panic!("resolve failed: {e}"),

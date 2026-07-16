@@ -38,6 +38,14 @@ pub enum ResolveError {
     #[error("resource not found")]
     NotFound,
 
+    /// A rootless URN was resolved over the untrusted rpc tier, where the trust root
+    /// cannot be established without trusting the gateway. Pin a root in the URN
+    /// (`urn:dig:chia:<store>:<root>/<path>`), or resolve via a loopback node. A
+    /// hard, fail-closed error — the resolver will not verify against a
+    /// gateway-asserted root.
+    #[error("a root-pinned URN is required to resolve over the public gateway (rootless URNs are not chain-verified there)")]
+    RootRequired,
+
     /// The served ciphertext failed integrity verification against the
     /// chain-anchored root (tampered bytes, a non-chaining proof, or a decoy from
     /// a wrong store). FAIL-CLOSED: the bytes are discarded, never returned.

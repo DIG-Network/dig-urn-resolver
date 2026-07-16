@@ -14,12 +14,21 @@ use dig_urn_resolver::{ResolveError, ResolveOptions, ResolveOutcome, ResolvedDat
 
 const IMG_KEY: &str = "img/logo.png";
 
+/// A dummy pinned root for tests that exercise reachability/protocol paths where the
+/// content bytes are irrelevant (the rpc tier requires a pinned root — HOLE B).
+const DUMMY_ROOT: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
 fn rootless_urn(key: &str) -> String {
     format!("urn:dig:chia:{STORE_HEX}/{key}")
 }
 
 fn root_pinned_urn(key: &str, root_hex: &str) -> String {
     format!("urn:dig:chia:{STORE_HEX}:{root_hex}/{key}")
+}
+
+/// A root-pinned URN with the dummy root, for rpc reachability/error tests.
+fn pinned(key: &str) -> String {
+    root_pinned_urn(key, DUMMY_ROOT)
 }
 
 /// Unwrap a `Success`, failing loudly on any other outcome.
@@ -38,7 +47,7 @@ fn node_serving(plaintext: Vec<u8>, content_type: &'static str) -> MockTransport
             if url.ends_with("/health") {
                 Ok(status(200))
             } else if url.contains("/s/") {
-                Ok(ok(pt.clone(), Some(content_type)))
+                Ok(node_response(pt.clone(), Some(content_type), true))
             } else {
                 Err(transport_err())
             }
@@ -47,16 +56,18 @@ fn node_serving(plaintext: Vec<u8>, content_type: &'static str) -> MockTransport
     )
 }
 
-/// A mock with NO node (health probes fail) but a serving rpc gateway.
+/// A mock with NO node (health probes fail) but a serving rpc gateway. The gateway
+/// serves ONLY `dig.getContent` — the resolver must never ask it for a trust root.
 fn rpc_serving(fx: RpcFixture) -> MockTransport {
     MockTransport::new(
         Box::new(|_url: &str| Err(transport_err())), // no node: every probe/GET fails
         Box::new(move |_url: &str, body: &str| {
             let req: serde_json::Value = serde_json::from_str(body).unwrap();
             match req["method"].as_str().unwrap() {
-                "dig.getAnchoredRoot" => Ok(rpc_ok(serde_json::json!({ "root": fx.root_hex }))),
                 "dig.getContent" => Ok(rpc_ok(get_content_result(&fx))),
-                other => panic!("unexpected rpc method {other}"),
+                other => panic!(
+                    "gateway must not be asked for {other} (trust-root must not come from it)"
+                ),
             }
         }),
     )
@@ -104,7 +115,7 @@ async fn node_content_type_falls_back_to_extension_when_header_absent() {
             if url.ends_with("/health") {
                 Ok(status(200))
             } else {
-                Ok(ok(vec![1, 2, 3], None))
+                Ok(node_response(vec![1, 2, 3], None, true))
             }
         }),
         Box::new(|_u, _b| Err(transport_err())),
@@ -140,35 +151,24 @@ async fn node_404_is_fail_closed_not_found() {
 // --- ladder: rpc fallback when no node -------------------------------------
 
 #[tokio::test]
-async fn rpc_tier_resolves_rootless_via_anchored_root() {
-    let fx = build_fixture(IMG_KEY, b"\x89PNG payload", None);
-    let data = success(
-        Resolver::new(rpc_serving(fx))
-            .resolve(&rootless_urn(IMG_KEY))
-            .await
-            .unwrap(),
-    );
-    assert_eq!(data.bytes, b"\x89PNG payload");
-    assert_eq!(data.content_type, "image/png");
+async fn rootless_urn_over_rpc_is_rejected() {
+    // HOLE B: with no node, a rootless URN cannot be chain-verified over the
+    // untrusted gateway → hard RootRequired, WITHOUT ever asking the gateway for a
+    // root (the mock panics if it is). Never data, never unreachable.
+    let fx = build_fixture(IMG_KEY, b"whatever", None);
+    let err = Resolver::new(rpc_serving(fx))
+        .resolve(&rootless_urn(IMG_KEY))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ResolveError::RootRequired));
 }
 
 #[tokio::test]
-async fn rpc_tier_resolves_root_pinned_without_anchored_root_call() {
+async fn rpc_tier_resolves_root_pinned() {
     let fx = build_fixture(IMG_KEY, b"pinned bytes", None);
     let root = fx.root_hex.clone();
-    // getAnchoredRoot must NOT be called for a root-pinned URN.
-    let t = MockTransport::new(
-        Box::new(|_u: &str| Err(transport_err())),
-        Box::new(move |_u: &str, body: &str| {
-            let req: serde_json::Value = serde_json::from_str(body).unwrap();
-            match req["method"].as_str().unwrap() {
-                "dig.getContent" => Ok(rpc_ok(get_content_result(&fx))),
-                other => panic!("root-pinned URN must not call {other}"),
-            }
-        }),
-    );
     let data = success(
-        Resolver::new(t)
+        Resolver::new(rpc_serving(fx))
             .resolve(&root_pinned_urn(IMG_KEY, &root))
             .await
             .unwrap(),
@@ -177,12 +177,17 @@ async fn rpc_tier_resolves_root_pinned_without_anchored_root_call() {
 }
 
 #[tokio::test]
-async fn rpc_private_store_salt_decrypts() {
+async fn rpc_private_store_salt_decrypts_root_pinned() {
     let salt = "cd".repeat(32);
     let fx = build_fixture(IMG_KEY, b"secret art", Some(&salt));
+    let root = fx.root_hex.clone();
     let data = success(
         Resolver::new(rpc_serving(fx))
-            .resolve(&format!("{}?salt={}", rootless_urn(IMG_KEY), salt))
+            .resolve(&format!(
+                "{}?salt={}",
+                root_pinned_urn(IMG_KEY, &root),
+                salt
+            ))
             .await
             .unwrap(),
     );
@@ -190,13 +195,14 @@ async fn rpc_private_store_salt_decrypts() {
 }
 
 #[tokio::test]
-async fn rpc_not_found_when_no_anchored_root() {
+async fn rpc_not_found_when_content_empty() {
+    // Root-pinned URN, gateway reports total_length 0 → hard NotFound.
     let t = MockTransport::new(
         Box::new(|_u: &str| Err(transport_err())),
-        Box::new(|_u: &str, _b: &str| Ok(rpc_ok(serde_json::json!({ "root": null })))),
+        Box::new(|_u: &str, _b: &str| Ok(rpc_ok(serde_json::json!({ "total_length": 0 })))),
     );
     let err = Resolver::new(t)
-        .resolve(&rootless_urn(IMG_KEY))
+        .resolve(&pinned(IMG_KEY))
         .await
         .unwrap_err();
     assert!(matches!(err, ResolveError::NotFound));
@@ -207,12 +213,13 @@ async fn rpc_not_found_when_no_anchored_root() {
 #[tokio::test]
 async fn tampered_ciphertext_is_integrity_failure_not_data() {
     let mut tampered = build_fixture(IMG_KEY, b"authentic", None);
+    let root = tampered.root_hex.clone();
     // Valid proof + root, but different ciphertext whose leaf won't match.
     tampered.ciphertext_b64 = base64_of(b"tampered ciphertext bytes!!");
     tampered.total_length = 27;
     tampered.chunk_lens = vec![27];
     let outcome = Resolver::new(rpc_serving(tampered))
-        .resolve(&rootless_urn(IMG_KEY))
+        .resolve(&root_pinned_urn(IMG_KEY, &root))
         .await
         .unwrap();
     assert_eq!(outcome, ResolveOutcome::IntegrityFailure);
@@ -227,9 +234,14 @@ async fn wrong_salt_is_integrity_failure() {
     // Ciphertext committed WITHOUT salt, resolved WITH one → inclusion verifies
     // (authentic bytes) but the decrypt tag fails → integrity failure.
     let fx = build_fixture(IMG_KEY, b"art", None);
+    let root = fx.root_hex.clone();
     let wrong_salt = "ef".repeat(32);
     let outcome = Resolver::new(rpc_serving(fx))
-        .resolve(&format!("{}?salt={}", rootless_urn(IMG_KEY), wrong_salt))
+        .resolve(&format!(
+            "{}?salt={}",
+            root_pinned_urn(IMG_KEY, &root),
+            wrong_salt
+        ))
         .await
         .unwrap();
     assert_eq!(outcome, ResolveOutcome::IntegrityFailure);
@@ -238,11 +250,12 @@ async fn wrong_salt_is_integrity_failure() {
 #[tokio::test]
 async fn integrity_failure_renders_security_page_never_the_bytes() {
     let mut tampered = build_fixture(IMG_KEY, b"authentic", None);
+    let root = tampered.root_hex.clone();
     tampered.ciphertext_b64 = base64_of(b"evil");
     tampered.total_length = 4;
     tampered.chunk_lens = vec![4];
     let rendered = Resolver::new(rpc_serving(tampered))
-        .resolve_rendered(&rootless_urn(IMG_KEY))
+        .resolve_rendered(&root_pinned_urn(IMG_KEY, &root))
         .await
         .unwrap();
     assert_eq!(rendered.content_type, "text/html");
@@ -272,7 +285,7 @@ async fn rpc_protocol_error_is_hard_error_not_unreachable() {
         }),
     );
     let err = Resolver::new(t)
-        .resolve(&rootless_urn(IMG_KEY))
+        .resolve(&pinned(IMG_KEY))
         .await
         .unwrap_err();
     assert!(matches!(err, ResolveError::Rpc(_)));
@@ -286,10 +299,7 @@ async fn both_tiers_unreachable_is_unreachable_outcome() {
         Box::new(|_u: &str| Err(transport_err())),
         Box::new(|_u: &str, _b: &str| Err(transport_err())),
     );
-    let outcome = Resolver::new(t)
-        .resolve(&rootless_urn(IMG_KEY))
-        .await
-        .unwrap();
+    let outcome = Resolver::new(t).resolve(&pinned(IMG_KEY)).await.unwrap();
     assert_eq!(outcome, ResolveOutcome::Unreachable);
 
     let rendered = outcome.render("https://dig.net");
@@ -313,33 +323,90 @@ async fn unreachable_connect_url_is_overridable() {
         ..Default::default()
     };
     let rendered = Resolver::with_options(t, opts)
-        .resolve_rendered(&rootless_urn(IMG_KEY))
+        .resolve_rendered(&pinned(IMG_KEY))
         .await
         .unwrap();
     let html = String::from_utf8(rendered.bytes).unwrap();
     assert!(html.contains("dig://home"));
 }
 
-// --- explicit override wins ------------------------------------------------
+// --- HOLE A: node trust is loopback-only -----------------------------------
 
 #[tokio::test]
-async fn override_endpoint_uses_node_when_healthy() {
+async fn node_without_x_dig_verified_is_fail_closed() {
+    // A loopback node serves 200 bytes but omits X-Dig-Verified → the node did not
+    // attest verification → fail closed (IntegrityFailure), never returned as data.
     let t = MockTransport::new(
         Box::new(|url: &str| {
-            assert!(
-                url.starts_with("http://my-node:1234"),
-                "override host: {url}"
-            );
             if url.ends_with("/health") {
                 Ok(status(200))
             } else {
-                Ok(ok(b"custom".to_vec(), Some("text/plain")))
+                Ok(node_response(
+                    b"unverified".to_vec(),
+                    Some("text/plain"),
+                    false,
+                ))
             }
         }),
         Box::new(|_u, _b| Err(transport_err())),
     );
+    let outcome = Resolver::new(t)
+        .resolve(&rootless_urn(IMG_KEY))
+        .await
+        .unwrap();
+    assert_eq!(outcome, ResolveOutcome::IntegrityFailure);
+}
+
+#[tokio::test]
+async fn override_remote_host_uses_verified_rpc_not_node() {
+    // HOLE A: an override at a REMOTE host must NOT be trusted as a node. It is
+    // routed to the client-verified rpc path — the node `/s/` + `/health` GETs are
+    // never called; only the verified rpc post is.
+    let fx = build_fixture(IMG_KEY, b"verified art", None);
+    let root = fx.root_hex.clone();
+    let t = MockTransport::new(
+        Box::new(|url: &str| panic!("remote override must not use the node path: {url}")),
+        Box::new(move |url: &str, body: &str| {
+            assert!(
+                url.starts_with("http://evil.example.com"),
+                "override base: {url}"
+            );
+            let req: serde_json::Value = serde_json::from_str(body).unwrap();
+            match req["method"].as_str().unwrap() {
+                "dig.getContent" => Ok(rpc_ok(get_content_result(&fx))),
+                other => panic!("unexpected method {other}"),
+            }
+        }),
+    );
     let opts = ResolveOptions {
-        endpoint: Some("http://my-node:1234".into()),
+        endpoint: Some("http://evil.example.com".into()),
+        ..Default::default()
+    };
+    let data = success(
+        Resolver::with_options(t, opts)
+            .resolve(&root_pinned_urn(IMG_KEY, &root))
+            .await
+            .unwrap(),
+    );
+    // The bytes came back ONLY because they verified against the pinned root.
+    assert_eq!(data.bytes, b"verified art");
+}
+
+#[tokio::test]
+async fn override_loopback_host_may_use_node() {
+    // A loopback override IS eligible for the node path (the user's own machine).
+    let t = MockTransport::new(
+        Box::new(|url: &str| {
+            assert!(
+                url.starts_with("http://127.0.0.1:9778"),
+                "loopback base: {url}"
+            );
+            Ok(node_response(b"local".to_vec(), Some("text/plain"), true))
+        }),
+        Box::new(|_u, _b| Err(transport_err())),
+    );
+    let opts = ResolveOptions {
+        endpoint: Some("http://127.0.0.1:9778".into()),
         ..Default::default()
     };
     let data = success(
@@ -348,11 +415,14 @@ async fn override_endpoint_uses_node_when_healthy() {
             .await
             .unwrap(),
     );
-    assert_eq!(data.bytes, b"custom");
+    assert_eq!(data.bytes, b"local");
 }
 
 #[tokio::test]
-async fn override_unreachable_does_not_leak_to_public_rpc() {
+async fn override_remote_unreachable_does_not_leak_to_public_rpc() {
+    // A remote override that is fully down → Unreachable, never a silent fallback to
+    // rpc.dig.net (the override is authoritative). Root-pinned so it reaches the rpc
+    // transport (the remote override IS an rpc endpoint) before failing.
     let t = MockTransport::new(
         Box::new(|_u: &str| Err(transport_err())),
         Box::new(|url: &str, _b: &str| {
@@ -361,11 +431,11 @@ async fn override_unreachable_does_not_leak_to_public_rpc() {
         }),
     );
     let opts = ResolveOptions {
-        endpoint: Some("http://my-node:1234".into()),
+        endpoint: Some("http://my-node.example.com:1234".into()),
         ..Default::default()
     };
     let outcome = Resolver::with_options(t, opts)
-        .resolve(&rootless_urn(IMG_KEY))
+        .resolve(&pinned(IMG_KEY))
         .await
         .unwrap();
     assert_eq!(outcome, ResolveOutcome::Unreachable);

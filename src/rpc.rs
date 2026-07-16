@@ -1,16 +1,26 @@
-//! The rpc read path — the blind fetch over the public gateway.
+//! The rpc read path — the blind fetch over the UNTRUSTED public gateway.
 //!
-//! The gateway relays opaque ciphertext + inclusion proofs; the client resolves the
-//! trust root (from the URN, or `dig.getAnchoredRoot` for a rootless URN), verifies
-//! the served bytes chain to it, and decrypts — the host stays BLIND. Unlike the
-//! oblivious SDK (which returns raw ciphertext when a URN does not decrypt), a
+//! The gateway relays opaque ciphertext + inclusion proofs; the client verifies the
+//! served bytes chain to a trusted root and decrypts — the host stays BLIND. Unlike
+//! the oblivious SDK (which returns raw ciphertext when a URN does not decrypt), a
 //! DISPLAY resolver MUST fail closed: a verify or decrypt failure is a hard error,
 //! never returned bytes.
 //!
-//! Wire (SYSTEM.md dig-node §): `dig.getAnchoredRoot {store_id} -> {root}` and
-//! `dig.getContent {store_id, root, retrieval_key, offset, length} ->
-//! {total_length, offset, next_offset?, complete?, ciphertext, inclusion_proof,
-//! chunk_lens}` (base64 ciphertext + proof), paged by `next_offset`/`complete`.
+//! # The trust root MUST come from the URN, not the gateway (security invariant)
+//!
+//! On this untrusted tier the trusted root is taken ONLY from a root-PINNED URN
+//! (`urn:…:<root>/…`). A ROOTLESS URN is REJECTED here ([`ResolveError::RootRequired`]):
+//! the only source of its current root would be `dig.getAnchoredRoot` returned by the
+//! SAME untrusted gateway, which for a public (unsalted) store lets a compromised
+//! gateway encrypt attacker bytes under the public URN key, prove them against its
+//! OWN fake root, and pass verification. Requiring a pinned root anchors trust
+//! outside the gateway. (A rootless URN over the LOOPBACK node path is fine — the
+//! local node is the trust anchor; the Sage NFT case pins the root regardless.)
+//!
+//! Wire (SYSTEM.md dig-node §): `dig.getContent {store_id, root, retrieval_key,
+//! offset, length} -> {total_length, offset, next_offset?, complete?, ciphertext,
+//! inclusion_proof, chunk_lens}` (base64 ciphertext + proof), paged by
+//! `next_offset`/`complete`.
 
 use crate::content_type;
 use crate::crypto;
@@ -25,11 +35,6 @@ use serde_json::json;
 /// The backend caps each `dig.getContent` window (Lambda/APIGW response ceiling);
 /// the client loops windows until `complete`.
 const RPC_WINDOW_BYTES: u64 = 3 * 1024 * 1024;
-
-#[derive(Deserialize)]
-struct AnchoredRoot {
-    root: Option<String>,
-}
 
 #[derive(Deserialize)]
 struct GetContent {
@@ -91,29 +96,14 @@ where
         .map_err(|e| ResolveError::Rpc(format!("rpc {method}: unexpected result shape ({e})")))
 }
 
-/// Resolve the trust root: the URN's pinned root, else the store's current
-/// anchored root from `dig.getAnchoredRoot`.
-async fn resolve_root<T: HttpTransport + ?Sized>(
-    transport: &T,
-    base: &str,
-    parsed: &ParsedUrn,
-) -> Result<String> {
-    if let Some(root) = parsed.root_hex() {
-        return Ok(root);
-    }
-    let r: AnchoredRoot = rpc_call(
-        transport,
-        base,
-        "dig.getAnchoredRoot",
-        json!({ "store_id": parsed.store_id_hex() }),
-    )
-    .await?;
-    r.root
-        .filter(|s| !s.is_empty())
-        .ok_or(ResolveError::NotFound)
+/// The trust root for the untrusted rpc tier — ONLY a root-pinned URN's root.
+/// A rootless URN is rejected (see the module security invariant): its root would
+/// otherwise come from the same untrusted gateway, defeating verification.
+fn trusted_root(parsed: &ParsedUrn) -> Result<String> {
+    parsed.root_hex().ok_or(ResolveError::RootRequired)
 }
 
-/// Fetch a resource over the rpc gateway: resolve the root, stream the windowed
+/// Fetch a resource over the rpc gateway: take the pinned root, stream the windowed
 /// ciphertext, then verify (fail-closed) + decrypt.
 pub async fn fetch<T: HttpTransport + ?Sized>(
     transport: &T,
@@ -121,7 +111,7 @@ pub async fn fetch<T: HttpTransport + ?Sized>(
     parsed: &ParsedUrn,
 ) -> Result<ResolvedData> {
     let base = base.trim_end_matches('/');
-    let root = resolve_root(transport, base, parsed).await?;
+    let root = trusted_root(parsed)?;
     let retrieval_key = parsed.retrieval_key_hex();
 
     let mut buf: Vec<u8> = Vec::new();

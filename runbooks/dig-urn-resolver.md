@@ -17,7 +17,7 @@ cargo clippy --all-targets --features native -- -D warnings
 
 # Coverage (must stay >= 80% lines)
 cargo llvm-cov --features native \
-  --ignore-filename-regex '(src/native\.rs|src/wasm\.rs)' --fail-under-lines 80
+  --ignore-filename-regex '(native|wasm)\.rs$' --fail-under-lines 80
 
 # The Sage NFT-image demo (offline, rpc-fallback)
 cargo run --example sage_nft_image

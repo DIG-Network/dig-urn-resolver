@@ -1,15 +1,25 @@
 //! The wasm-bindgen surface + a browser-`fetch` transport.
 //!
 //! Only compiled with the `wasm` feature (built by wasm-pack into
-//! `@dignetwork/dig-urn-resolver`). Exposes two async entry points:
+//! `@dignetwork/dig-urn-resolver`). The documented FRONT DOOR is the branded
+//! [`DigNetwork`] client:
 //!
-//! * [`resolve`] — `Promise<{ outcome, bytes: Uint8Array, contentType: string }>`
-//!   where `outcome` is `"success"` / `"integrity_failure"` / `"unreachable"`. For a
-//!   non-success outcome `bytes` is the branded `text/html` page (never the
-//!   unverified content), so the app can render it or key off `outcome`.
-//! * [`resolveObjectUrl`] — `Promise<string>`: a `blob:` object URL usable directly
-//!   as an `<img src>` — the Sage NFT-image case. On an integrity failure this is
-//!   the security page, NEVER the unverified bytes.
+//! ```js
+//! import init, { DigNetwork } from "@dignetwork/dig-urn-resolver";
+//! await init();
+//! const dig = new DigNetwork();
+//! img.src = await dig.resolveImageUrl(nftUrn);       // <img src> (Sage NFT image)
+//! const { outcome, bytes, contentType } = await dig.resolve(urn);
+//! ```
+//!
+//! - `dig.resolve(urn)` → `{ outcome, bytes: Uint8Array, contentType }`, `outcome ∈
+//!   "success" | "integrity_failure" | "unreachable"`. For a non-success outcome
+//!   `bytes` is the branded `text/html` page — never unverified content.
+//! - `dig.resolveImageUrl(urn)` → a `blob:` object URL for `<img src>`. On an
+//!   integrity failure it is the branded security page, NEVER the unverified bytes.
+//!
+//! The lower-level free functions [`resolve`] / [`resolveObjectUrl`] remain
+//! available, but `DigNetwork` is the SDK front door (README + example use it).
 //!
 //! CORS note for consuming apps (e.g. Sage/Tauri): the `/health` + `/s/` probes hit
 //! `dig.local`/`localhost` from the app origin and MAY be CORS-blocked; the
@@ -130,34 +140,15 @@ async fn do_resolve(
     resolver(endpoint, connect_url).resolve(&urn).await
 }
 
-/// Resolve a DIG URN to a typed outcome.
-///
-/// Resolves to `{ outcome, bytes: Uint8Array, contentType: string }` where `outcome`
-/// is one of `"success"`, `"integrity_failure"`, or `"unreachable"`:
-///
-/// * `"success"` — `bytes` is the VERIFIED content, `contentType` its MIME type.
-/// * `"integrity_failure"` — the served bytes failed verification (tampered/decoy).
-///   A SECURITY failure: `bytes` is the branded "Integrity Verification Failed"
-///   `text/html` page, NEVER the unverified content.
-/// * `"unreachable"` — every tier was down: `bytes` is the branded "DIG Network
-///   unreachable" `text/html` page.
-///
-/// Rejects (throws) only on a hard error: a malformed URN, a not-found resource, or
-/// a reachable rpc protocol error.
-#[wasm_bindgen]
-pub async fn resolve(
-    urn: String,
-    endpoint: Option<String>,
-    connect_url: Option<String>,
-) -> Result<JsValue, JsError> {
-    let connect = connect_url.clone();
-    let outcome = do_resolve(urn, endpoint, connect_url)
-        .await
-        .map_err(|e| JsError::new(&e.to_string()))?;
+/// The effective connect-CTA URL for the unreachable page (default if unset).
+fn connect_or_default(connect_url: Option<String>) -> String {
+    opt(connect_url).unwrap_or_else(|| crate::pages::DEFAULT_CONNECT_URL.to_string())
+}
 
-    let connect_url = opt(connect).unwrap_or_else(|| crate::pages::DEFAULT_CONNECT_URL.to_string());
-    let rendered = outcome.render(&connect_url);
-
+/// Shape an outcome into the JS object `{ outcome, bytes, contentType }`. For a
+/// non-success outcome `bytes` is the branded page (never unverified content).
+fn outcome_to_js(outcome: &ResolveOutcome, connect_url: &str) -> JsValue {
+    let rendered = outcome.render(connect_url);
     let obj = js_sys::Object::new();
     set(&obj, "outcome", &JsValue::from_str(outcome.kind()));
     set(
@@ -170,32 +161,105 @@ pub async fn resolve(
         "contentType",
         &JsValue::from_str(&rendered.content_type),
     );
-    Ok(obj.into())
+    obj.into()
 }
 
-/// Resolve a DIG URN to a `blob:` object URL usable directly as an `<img src>` —
-/// the Sage NFT-image helper.
+/// Shape an outcome into a `blob:` object URL. `render` is the ONLY byte source, so
+/// an integrity failure yields the security page — NEVER the unverified content.
+fn outcome_to_object_url(outcome: &ResolveOutcome, connect_url: &str) -> Result<String, JsError> {
+    let rendered = outcome.render(connect_url);
+    object_url(&rendered.bytes, &rendered.content_type).map_err(|e| JsError::new(&e.to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// Branded SDK front door — `DigNetwork`
+// ---------------------------------------------------------------------------
+
+/// The DIG Network resolver client — the documented, front-door JS/TS API.
 ///
-/// On `"success"` the URL is the VERIFIED content. On `"integrity_failure"` the URL
-/// is the branded "Integrity Verification Failed" `text/html` page — the unverified
-/// bytes are NEVER returned as an image. On `"unreachable"` it is the branded
-/// unreachable page. Pair with [`resolve`] when the app must distinguish the cases
-/// programmatically. Revoke the URL (`URL.revokeObjectURL`) when done.
+/// ```js
+/// import init, { DigNetwork } from "@dignetwork/dig-urn-resolver";
+/// await init();
+/// const dig = new DigNetwork();                 // or new DigNetwork(endpoint, connectUrl)
+/// img.src = await dig.resolveImageUrl(nftUrn);  // <img src> — works node-absent (rpc)
+/// const { outcome, bytes, contentType } = await dig.resolve(urn);
+/// ```
+///
+/// Construct once and reuse — the ladder plan is cached per instance.
+#[wasm_bindgen]
+#[derive(Clone)]
+pub struct DigNetwork {
+    endpoint: Option<String>,
+    connect_url: Option<String>,
+}
+
+#[wasm_bindgen]
+impl DigNetwork {
+    /// `new DigNetwork(endpoint?, connectUrl?)`.
+    ///
+    /// * `endpoint` — an explicit node/gateway override (§5.3): it WINS over the
+    ///   auto-ladder. A loopback host may use the node path; any other host is used
+    ///   as a client-verified rpc endpoint.
+    /// * `connectUrl` — the "Connect to Node" target on the unreachable page.
+    #[wasm_bindgen(constructor)]
+    pub fn new(endpoint: Option<String>, connect_url: Option<String>) -> DigNetwork {
+        DigNetwork {
+            endpoint: opt(endpoint),
+            connect_url: opt(connect_url),
+        }
+    }
+
+    /// Resolve a DIG URN to a typed outcome: `{ outcome, bytes: Uint8Array,
+    /// contentType: string }`, `outcome ∈ "success" | "integrity_failure" |
+    /// "unreachable"`. For a non-success outcome `bytes` is the branded `text/html`
+    /// page, never unverified content. Rejects only on a hard error (bad URN,
+    /// not-found, reachable rpc protocol error, or a rootless URN over the gateway).
+    pub async fn resolve(&self, urn: String) -> Result<JsValue, JsError> {
+        let (endpoint, connect) = (self.endpoint.clone(), self.connect_url.clone());
+        let outcome = do_resolve(urn, endpoint, connect.clone())
+            .await
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        Ok(outcome_to_js(&outcome, &connect_or_default(connect)))
+    }
+
+    /// Resolve a DIG URN to a `blob:` object URL usable directly as an `<img src>` —
+    /// the Sage NFT-image path. On an integrity failure this is the branded security
+    /// page, NEVER the unverified bytes as an image; on unreachable, the branded
+    /// unreachable page. Revoke the URL (`URL.revokeObjectURL`) when done.
+    #[wasm_bindgen(js_name = resolveImageUrl)]
+    pub async fn resolve_image_url(&self, urn: String) -> Result<String, JsError> {
+        let (endpoint, connect) = (self.endpoint.clone(), self.connect_url.clone());
+        let outcome = do_resolve(urn, endpoint, connect.clone())
+            .await
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        outcome_to_object_url(&outcome, &connect_or_default(connect))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Low-level free functions (the branded `DigNetwork` above is the front door)
+// ---------------------------------------------------------------------------
+
+/// Low-level: resolve to `{ outcome, bytes, contentType }`. Prefer [`DigNetwork`].
+#[wasm_bindgen]
+pub async fn resolve(
+    urn: String,
+    endpoint: Option<String>,
+    connect_url: Option<String>,
+) -> Result<JsValue, JsError> {
+    DigNetwork::new(endpoint, connect_url).resolve(urn).await
+}
+
+/// Low-level: resolve to a `blob:` object URL. Prefer [`DigNetwork::resolveImageUrl`].
 #[wasm_bindgen(js_name = resolveObjectUrl)]
 pub async fn resolve_object_url(
     urn: String,
     endpoint: Option<String>,
     connect_url: Option<String>,
 ) -> Result<String, JsError> {
-    let connect = connect_url.clone();
-    let outcome = do_resolve(urn, endpoint, connect_url)
+    DigNetwork::new(endpoint, connect_url)
+        .resolve_image_url(urn)
         .await
-        .map_err(|e| JsError::new(&e.to_string()))?;
-    let connect_url = opt(connect).unwrap_or_else(|| crate::pages::DEFAULT_CONNECT_URL.to_string());
-    // `render` is the ONLY byte source: an integrity failure yields the security
-    // page, never the unverified content.
-    let rendered = outcome.render(&connect_url);
-    object_url(&rendered.bytes, &rendered.content_type).map_err(|e| JsError::new(&e.to_string()))
 }
 
 /// Build a `blob:` object URL from bytes + a MIME type.

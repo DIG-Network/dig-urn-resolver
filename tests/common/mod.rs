@@ -50,6 +50,17 @@ pub fn ok(body: Vec<u8>, content_type: Option<&str>) -> HttpResponse {
     }
 }
 
+/// A dig-node `/s/` response: body + optional content-type + the `X-Dig-Verified`
+/// attestation (`verified` controls whether the node claims it verified the bytes).
+pub fn node_response(body: Vec<u8>, content_type: Option<&str>, verified: bool) -> HttpResponse {
+    let mut resp = ok(body, content_type);
+    if verified {
+        resp.headers
+            .push(("x-dig-verified".to_string(), "true".to_string()));
+    }
+    resp
+}
+
 /// A bare status response with no body.
 pub fn status(code: u16) -> HttpResponse {
     HttpResponse {

@@ -77,7 +77,7 @@ jobs:
       - name: Run coverage with 80% line gate
         run: >
           cargo llvm-cov nextest --features native
-          --ignore-filename-regex '(src/native\.rs|src/wasm\.rs)'
+          --ignore-filename-regex '(native|wasm)\.rs$'
           --fail-under-lines 80 --retries 2 --test-threads 1
 
   wasm-build:
@@ -98,6 +98,11 @@ jobs:
 
       - name: Install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      # Prove the crate is wasm-CLEAN: a full wasm32 compile with digstore-core
+      # default-features=false must succeed with no getrandom/blst leaks.
+      - name: Build wasm32 (wasm-clean check)
+        run: cargo build --target wasm32-unknown-unknown --no-default-features --features wasm
 
       - name: Build the npm package (bundler target)
         run: wasm-pack build --target bundler --scope dignetwork -- --no-default-features --features wasm
