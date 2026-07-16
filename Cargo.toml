@@ -1,6 +1,6 @@
 [package]
 name = "dig-urn-resolver"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 rust-version = "1.75.0"
 description = "Resolve a DIG URN to its data through the protocol (node-first ladder, verified + decrypted). Rust + wasm; first consumer: Sage wallet NFT images."
@@ -33,7 +33,7 @@ wasm = [
 # (`derive_decryption_key` + `decrypt_chunk`). `default-features = false` selects the pure
 # `alloc` core (no `blst`/BLS, no `getrandom`) so the SAME crate compiles for native AND
 # wasm — the single source of truth for the crypto, never reimplemented here.
-digstore-core = { git = "https://github.com/DIG-Network/digstore", rev = "e93cf67b84606f12920f6b10e1f2064f8c6ebd18", default-features = false }
+digstore-core = { version = "0.13.4", default-features = false }
 
 async-trait = "0.1"
 base64 = "0.22"
