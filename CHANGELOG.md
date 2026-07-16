@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.1.2] - 2026-07-16
+
+### CI
+- **publish-npm:** Run the OIDC publish on node 22 (#3)
+
 ## [0.1.1] - 2026-07-16
 
 ### CI
