@@ -179,8 +179,15 @@ map (`browser`/`import` → web, `node`/`require` → node).
 
 The front-door API is the branded `DigNetwork` class:
 
-- `new DigNetwork(endpoint?, connectUrl?, cachePath?)` — `cachePath` is an optional
-  disk-cache directory (native; ignored in the browser, see §11).
+- `new DigNetwork(options?)` — a single, named-field options object (NOT positional
+  args). `options` is a `DigNetworkOptions` with all-optional fields
+  `{ endpoint?, connectUrl?, cachePath? }`; an omitted (or blank) field keeps its
+  §5.3 default, so `new DigNetwork()` is all-defaults and `new DigNetwork({ cachePath })`
+  sets only the disk cache. Unknown properties are ignored. `cachePath` is an optional
+  disk-cache directory (native/Node.js; ignored in the browser, see §11). The
+  configured fields are readable back via the `endpoint` / `connectUrl` / `cachePath`
+  getters. The package's generated `.d.ts` MUST export the `DigNetworkOptions`
+  interface with those named fields (never `any`).
 - `dig.resolve(urn) : Promise<{ outcome, bytes, contentType }>`, `outcome ∈
   "success" | "integrity_failure" | "unreachable"`. `contentType` is present on
   EVERY result.

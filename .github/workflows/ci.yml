@@ -113,6 +113,11 @@ jobs:
       - name: Test wasm on Node (disk cache)
         run: wasm-pack test --node -- --no-default-features --features wasm --test wasm_disk
 
+      # The `DigNetwork` constructor's options-object contract (named fields, not
+      # positional args): defaults / partial / full / unknown-field tolerance.
+      - name: Test wasm on Node (constructor options object)
+        run: wasm-pack test --node -- --no-default-features --features wasm --test wasm_ctor
+
       # Assemble the DUAL-TARGET npm package (web + node) and smoke-test that the
       # Node entry loads (require + version()) AND injects fs (cachePath disk cache).
       - name: Build the dual-target npm package

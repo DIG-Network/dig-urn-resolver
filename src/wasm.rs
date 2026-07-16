@@ -7,7 +7,7 @@
 //! ```js
 //! import init, { DigNetwork } from "@dignetwork/dig-urn-resolver";
 //! await init();
-//! const dig = new DigNetwork();
+//! const dig = new DigNetwork();                      // all defaults; or new DigNetwork({ cachePath })
 //! img.src = await dig.resolveImageUrl(nftUrn);       // <img src> (Sage NFT image)
 //! const { outcome, bytes, contentType } = await dig.resolve(urn);
 //! ```
@@ -209,12 +209,52 @@ fn outcome_to_result(outcome: &ResolveOutcome, connect_url: &str) -> ResolveResu
 // Branded SDK front door — `DigNetwork`
 // ---------------------------------------------------------------------------
 
+/// The typed options object accepted by the [`DigNetwork`] constructor. Declaring it
+/// as a `typescript_custom_section` interface + an extern type gives the generated
+/// `.d.ts` a `constructor(options?: DigNetworkOptions)` signature with NAMED fields
+/// (not `any`), so a consumer sets only what it needs.
+#[wasm_bindgen(typescript_custom_section)]
+const TS_DIG_NETWORK_OPTIONS: &'static str = r#"
+/** Options for the {@link DigNetwork} constructor. Every field is optional; an
+ *  omitted field keeps its §5.3 default. */
+export interface DigNetworkOptions {
+    /** An explicit node/gateway endpoint override — WINS over the auto-ladder. A
+     *  loopback host may use the node path; any other host is a client-verified rpc
+     *  endpoint. */
+    endpoint?: string;
+    /** The "Connect to Node" target shown on the unreachable page. */
+    connectUrl?: string;
+    /** A disk-cache directory (persisted, re-verified on read). Absent ⇒ the
+     *  in-memory LRU only. Ignored in the browser (no filesystem). */
+    cachePath?: string;
+}
+"#;
+
+#[wasm_bindgen]
+extern "C" {
+    /// The `DigNetworkOptions` TS interface (see [`TS_DIG_NETWORK_OPTIONS`]), surfaced
+    /// to Rust as an opaque JS value the constructor deserializes.
+    #[wasm_bindgen(typescript_type = "DigNetworkOptions")]
+    pub type DigNetworkOptions;
+}
+
+/// The `DigNetwork` options, deserialized from the JS [`DigNetworkOptions`] object.
+/// Field names are camelCase on the JS side; every field defaults to absent.
+#[derive(Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct ParsedOptions {
+    endpoint: Option<String>,
+    connect_url: Option<String>,
+    cache_path: Option<String>,
+}
+
 /// The DIG Network resolver client — the documented, front-door JS/TS API.
 ///
 /// ```js
 /// import init, { DigNetwork } from "@dignetwork/dig-urn-resolver";
 /// await init();
-/// const dig = new DigNetwork();                 // or new DigNetwork(endpoint, connectUrl, cachePath)
+/// const dig = new DigNetwork();                              // all defaults
+/// const dig2 = new DigNetwork({ cachePath: "/var/cache" });  // only what you need
 /// img.src = await dig.resolveImageUrl(nftUrn);  // <img src> — works node-absent (rpc)
 /// const { outcome, bytes, contentType } = await dig.resolve(urn);
 /// ```
@@ -229,19 +269,10 @@ pub struct DigNetwork {
     cache_path: Option<String>,
 }
 
-#[wasm_bindgen]
 impl DigNetwork {
-    /// `new DigNetwork(endpoint?, connectUrl?, cachePath?)`.
-    ///
-    /// * `endpoint` — an explicit node/gateway override (§5.3): it WINS over the
-    ///   auto-ladder. A loopback host may use the node path; any other host is used
-    ///   as a client-verified rpc endpoint.
-    /// * `connectUrl` — the "Connect to Node" target on the unreachable page.
-    /// * `cachePath` — a DISK cache directory (persisted, re-verified on read).
-    ///   Absent ⇒ the in-memory LRU only. IGNORED in the browser (no filesystem) —
-    ///   the in-memory cache still applies.
-    #[wasm_bindgen(constructor)]
-    pub fn new(
+    /// Build a client from already-normalized parts (the internal constructor the
+    /// low-level free functions share). Blank strings are treated as unset.
+    fn from_parts(
         endpoint: Option<String>,
         connect_url: Option<String>,
         cache_path: Option<String>,
@@ -251,6 +282,49 @@ impl DigNetwork {
             connect_url: opt(connect_url),
             cache_path: opt(cache_path),
         }
+    }
+}
+
+#[wasm_bindgen]
+impl DigNetwork {
+    /// `new DigNetwork(options?)` — a single, named-field options object (never
+    /// positional args). Every field of [`DigNetworkOptions`] is optional; an omitted
+    /// (or blank) field keeps its §5.3 default, so `new DigNetwork()` is all-defaults
+    /// and `new DigNetwork({ cachePath })` sets only the disk cache.
+    ///
+    /// * `endpoint` — an explicit node/gateway override (§5.3): it WINS over the
+    ///   auto-ladder. A loopback host may use the node path; any other host is used
+    ///   as a client-verified rpc endpoint.
+    /// * `connectUrl` — the "Connect to Node" target on the unreachable page.
+    /// * `cachePath` — a DISK cache directory (persisted, re-verified on read).
+    ///   Absent ⇒ the in-memory LRU only. IGNORED in the browser (no filesystem) —
+    ///   the in-memory cache still applies.
+    #[wasm_bindgen(constructor)]
+    pub fn new(options: Option<DigNetworkOptions>) -> DigNetwork {
+        // A malformed value (not an object) degrades to all-defaults rather than
+        // throwing from the constructor; unknown properties are ignored.
+        let parsed: ParsedOptions = options
+            .and_then(|o| serde_wasm_bindgen::from_value(JsValue::from(o)).ok())
+            .unwrap_or_default();
+        DigNetwork::from_parts(parsed.endpoint, parsed.connect_url, parsed.cache_path)
+    }
+
+    /// The configured endpoint override, if any (`undefined` when the auto-ladder is used).
+    #[wasm_bindgen(getter)]
+    pub fn endpoint(&self) -> Option<String> {
+        self.endpoint.clone()
+    }
+
+    /// The configured "Connect to Node" URL, if any.
+    #[wasm_bindgen(getter, js_name = connectUrl)]
+    pub fn connect_url(&self) -> Option<String> {
+        self.connect_url.clone()
+    }
+
+    /// The configured disk-cache directory, if any.
+    #[wasm_bindgen(getter, js_name = cachePath)]
+    pub fn cache_path(&self) -> Option<String> {
+        self.cache_path.clone()
     }
 
     /// Resolve a DIG URN to a typed [`ResolveResult`] (`outcome`, `bytes`, and — on
@@ -318,7 +392,7 @@ pub async fn resolve(
     endpoint: Option<String>,
     connect_url: Option<String>,
 ) -> Result<ResolveResult, JsError> {
-    DigNetwork::new(endpoint, connect_url, None)
+    DigNetwork::from_parts(endpoint, connect_url, None)
         .resolve(urn)
         .await
 }
@@ -331,7 +405,7 @@ pub async fn resolve_object_url(
     endpoint: Option<String>,
     connect_url: Option<String>,
 ) -> Result<String, JsError> {
-    DigNetwork::new(endpoint, connect_url, None)
+    DigNetwork::from_parts(endpoint, connect_url, None)
         .resolve_image_url(urn)
         .await
 }

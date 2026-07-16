@@ -87,7 +87,9 @@ The front-door API is the branded, well-typed **`DigNetwork`** client:
 import init, { DigNetwork } from "@dignetwork/dig-urn-resolver";
 await init();
 
-const dig = new DigNetwork();        // or: new DigNetwork(endpoint, connectUrl, cachePath)
+const dig = new DigNetwork();                         // all defaults
+// or pass an options object — set only what you need, no undefined placeholders:
+// const dig = new DigNetwork({ endpoint, connectUrl, cachePath });
 
 // The NFT-image case — a URL for <img src>, working with no dig-node running:
 img.src = await dig.resolveImageUrl(nftDataUri);
@@ -152,7 +154,7 @@ async fn main() {
 ```
 
 In the `@dignetwork/dig-urn-resolver` wasm package the `DigNetwork` constructor takes
-the same `cachePath` as its third argument, and it is **fully functional under
+an options object with the same `cachePath` field, and it is **fully functional under
 Node.js** — the Node build injects Node's `fs`, so verified results persist to the
 given directory and are re-verified on read, exactly like the native crate:
 
@@ -160,12 +162,16 @@ given directory and are re-verified on read, exactly like the native crate:
 // Node.js service (CommonJS) — a persistent, cross-run disk cache
 const { DigNetwork } = require("@dignetwork/dig-urn-resolver");
 
-//                         endpoint  connectUrl  cachePath
-const dig = new DigNetwork(undefined, undefined, "/var/cache/dig-urn");
+// Set ONLY the field you need — no undefined placeholders.
+const dig = new DigNetwork({ cachePath: "/var/cache/dig-urn" });
 
 // First run fetches + verifies; a later run (same cachePath) re-serves from disk.
 const img = await dig.resolveImageUrl("urn:dig:chia:<store>:<root>/img/logo.png");
 ```
+
+The options object accepts `{ endpoint?, connectUrl?, cachePath? }` (all optional);
+the generated TypeScript exports a `DigNetworkOptions` interface with those named
+fields.
 
 **Clientside (browser) `cachePath` is a harmless no-op** — a browser has no
 filesystem, so the wasm build never wires `fs` there and the bounded in-memory cache
