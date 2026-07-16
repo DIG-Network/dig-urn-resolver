@@ -1,0 +1,51 @@
+name: publish-npm
+
+# Publish the resolver WASM as @dignetwork/dig-urn-resolver. Builds the
+# wasm-bindgen `bundler` target (works with Vite/webpack/rollup — the way Sage and
+# other apps consume it), scopes the package to @dignetwork, copies the LICENSE in,
+# and publishes. Auth uses the org-level NPM_TOKEN secret (public repo). Runs when a
+# GitHub Release is published (the release.yml tag → release), or on manual dispatch.
+# Mirrors digstore's publish-npm.yml.
+on:
+  release:
+    types: [published]
+  workflow_dispatch: {}
+
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: build wasm + npm publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Build @dignetwork/dig-urn-resolver (bundler target)
+        run: wasm-pack build --target bundler --scope dignetwork -- --no-default-features --features wasm
+
+      - name: Include the LICENSE in the package
+        run: cp LICENSE pkg/LICENSE
+
+      - name: Publish to npmjs
+        run: npm publish ./pkg --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
