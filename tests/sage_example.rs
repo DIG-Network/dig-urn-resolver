@@ -1,3 +1,5 @@
+// Native-only: this acceptance test runs on a tokio runtime (not wasm).
+#![cfg(not(target_arch = "wasm32"))]
 //! Acceptance test for the FIRST consumer (Sage wallet NFT images):
 //!
 //! An NFT whose `data`-uri is a root-pinned DIG URN resolves to a displayable

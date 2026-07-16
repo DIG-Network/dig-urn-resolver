@@ -108,10 +108,15 @@ jobs:
       - name: Build wasm32 (wasm-clean check)
         run: cargo build --target wasm32-unknown-unknown --no-default-features --features wasm
 
+      # Exercise the wasm disk cache under Node: `cachePath` persists + re-reads real
+      # files once Node's `fs` is injected (the browser stays inert).
+      - name: Test wasm on Node (disk cache)
+        run: wasm-pack test --node -- --no-default-features --features wasm --test wasm_disk
+
       # Assemble the DUAL-TARGET npm package (web + node) and smoke-test that the
-      # Node entry loads (require + version()).
+      # Node entry loads (require + version()) AND injects fs (cachePath disk cache).
       - name: Build the dual-target npm package
         run: node scripts/build-npm.mjs
 
       - name: Smoke-test the Node build loads
-        run: node -e "const m=require('./pkg'); if(typeof m.version!=='function'||typeof m.DigNetwork!=='function') throw new Error('node build missing API'); console.log('node build ok', m.version())"
+        run: node -e "const m=require('./pkg'); if(typeof m.version!=='function'||typeof m.DigNetwork!=='function') throw new Error('node build missing API'); if(typeof m.__dig_set_node_fs!=='function') throw new Error('node build missing fs injector'); console.log('node build ok', m.version())"

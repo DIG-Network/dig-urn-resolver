@@ -26,8 +26,8 @@ use crate::pages;
 use crate::transport::HttpTransport;
 use crate::urn::ParsedUrn;
 use crate::{node, rpc};
-// Used only by the native disk-cache re-verify path.
-#[cfg(feature = "native")]
+// Used only by the disk-cache re-verify path (native std::fs OR wasm Node `fs`).
+#[cfg(any(feature = "native", feature = "wasm"))]
 use crate::{content_type, crypto};
 use std::cell::RefCell;
 
@@ -41,9 +41,10 @@ pub(crate) struct Fetched {
     /// node path) — `None` when the tier did not expose it (then it is not cached).
     pub root: Option<String>,
     /// The verifiable rpc artifacts (ciphertext + proof + chunk lens) for the disk
-    /// cache; `None` when the bytes are not re-verifiable. Consumed by the native
-    /// disk cache; unused on wasm (no filesystem).
-    #[cfg_attr(not(feature = "native"), allow(dead_code))]
+    /// cache; `None` when the bytes are not re-verifiable. Consumed by the disk cache
+    /// (native std::fs, or the wasm Node `fs` backend); ignored when no disk cache is
+    /// configured or when running clientside (browser has no filesystem).
+    #[cfg_attr(not(any(feature = "native", feature = "wasm")), allow(dead_code))]
     pub artifacts: Option<DiskArtifacts>,
 }
 
@@ -133,9 +134,11 @@ pub struct ResolveOptions {
     /// Override the "Connect to Node" CTA target on the unreachable page. Defaults
     /// to [`pages::DEFAULT_CONNECT_URL`].
     pub connect_url: Option<String>,
-    /// Optional DISK cache directory (native only). When set, verified rpc results
-    /// are persisted (as re-verifiable artifacts) and re-verified on read; absent ⇒
-    /// the in-memory cache only. Ignored on wasm (no filesystem).
+    /// Optional DISK cache directory. When set, verified rpc results are persisted
+    /// (as re-verifiable artifacts) and re-verified on read; absent ⇒ the in-memory
+    /// cache only. Backed by `std::fs` natively and by Node's `fs` in the wasm build
+    /// under Node.js; a no-op clientside (a browser has no filesystem), where the
+    /// in-memory cache still applies.
     pub cache_path: Option<String>,
 }
 
@@ -145,7 +148,7 @@ pub struct Resolver<T: HttpTransport + ?Sized> {
     options: ResolveOptions,
     plan_cache: RefCell<Option<Vec<Endpoint>>>,
     memory: MemoryCache,
-    #[cfg(feature = "native")]
+    #[cfg(any(feature = "native", feature = "wasm"))]
     disk: Option<cache::DiskCache>,
     transport: T,
 }
@@ -158,12 +161,12 @@ impl<T: HttpTransport> Resolver<T> {
 
     /// Build a resolver with explicit options.
     pub fn with_options(transport: T, options: ResolveOptions) -> Self {
-        #[cfg(feature = "native")]
+        #[cfg(any(feature = "native", feature = "wasm"))]
         let disk = options.cache_path.as_ref().map(cache::DiskCache::new);
         Resolver {
             plan_cache: RefCell::new(None),
             memory: MemoryCache::new(cache::DEFAULT_MEMORY_ENTRIES, cache::DEFAULT_MEMORY_BYTES),
-            #[cfg(feature = "native")]
+            #[cfg(any(feature = "native", feature = "wasm"))]
             disk,
             options,
             transport,
@@ -211,7 +214,7 @@ impl<T: HttpTransport + ?Sized> Resolver<T> {
     /// A disk-cache hit, RE-VERIFIED against the URN's pinned root before use. `None`
     /// on miss (or a malformed entry). A tampered entry FAILS re-verification →
     /// `Some(IntegrityFailure)` and the bad file is dropped — never serves bad bytes.
-    #[cfg(feature = "native")]
+    #[cfg(any(feature = "native", feature = "wasm"))]
     fn disk_get_verified(&self, parsed: &ParsedUrn, id: &str) -> Option<ResolveOutcome> {
         let disk = self.disk.as_ref()?;
         let root = parsed.root_hex()?; // disk cache is rpc/root-pinned only
@@ -240,7 +243,7 @@ impl<T: HttpTransport + ?Sized> Resolver<T> {
         }
     }
 
-    #[cfg(not(feature = "native"))]
+    #[cfg(not(any(feature = "native", feature = "wasm")))]
     fn disk_get_verified(&self, _parsed: &ParsedUrn, _id: &str) -> Option<ResolveOutcome> {
         None
     }
@@ -253,7 +256,7 @@ impl<T: HttpTransport + ?Sized> Resolver<T> {
         };
         let id = Self::cache_id(parsed, root);
         self.memory.put(id.clone(), fetched.data.clone());
-        #[cfg(feature = "native")]
+        #[cfg(any(feature = "native", feature = "wasm"))]
         if let (Some(disk), Some(art)) = (self.disk.as_ref(), fetched.artifacts.as_ref()) {
             disk.put(&id, art);
         }

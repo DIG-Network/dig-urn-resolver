@@ -1,3 +1,5 @@
+// Native-only: the mock-transport suite runs on a tokio runtime (not wasm).
+#![cfg(not(target_arch = "wasm32"))]
 //! End-to-end resolver behaviour over the in-memory mock transport (no network),
 //! exercising the genuine `digstore_core` read-crypto via real fixtures.
 //!
