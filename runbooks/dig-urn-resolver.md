@@ -22,9 +22,10 @@ cargo llvm-cov --features native \
 # The Sage NFT-image demo (offline, rpc-fallback)
 cargo run --example sage_nft_image
 
-# Wasm / npm package (bundler target, works with Vite/webpack/rollup)
-wasm-pack build --target bundler --scope dignetwork -- --no-default-features --features wasm
-# → ./pkg (name: @dignetwork/dig-urn-resolver)
+# Wasm / npm package — DUAL target (browser ESM + Node CommonJS)
+node scripts/build-npm.mjs
+# → ./pkg (@dignetwork/dig-urn-resolver): web/ (ESM) + node/ (CJS), exports-routed.
+# Requires wasm-pack + the wasm32-unknown-unknown target + Node on PATH.
 ```
 
 ## Release + publish
@@ -37,9 +38,9 @@ Tag-driven, per-merge (a `modules/crates` repo — CLAUDE.md §3.6 model B):
 2. On merge to `main`, `release.yml` regenerates `CHANGELOG.md` (git-cliff), commits
    it, tags `vX.Y.Z`, and pushes the tag with `RELEASE_TOKEN`. The GitHub Release
    triggers `publish-npm.yml`.
-3. `publish-npm.yml` builds the `bundler` wasm target scoped to `@dignetwork`, copies
-   the LICENSE in, and `npm publish`es `@dignetwork/dig-urn-resolver` using the org
-   `NPM_TOKEN`.
+3. `publish-npm.yml` assembles the dual-target package (`scripts/build-npm.mjs` — web
+   ESM + node CJS) and `npm publish`es `@dignetwork/dig-urn-resolver` using the org
+   `NPM_TOKEN`. The package imports cleanly in both a browser bundler and Node.js.
 
 ### Secrets
 

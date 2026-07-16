@@ -32,6 +32,7 @@ use crate::error::ResolveError;
 use crate::resolver::{ResolveOptions, ResolveOutcome, Resolver};
 use crate::transport::{HttpResponse, HttpTransport, TransportError};
 use async_trait::async_trait;
+use base64::Engine;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
@@ -282,6 +283,9 @@ impl DigNetwork {
     ///
     /// FAIL-CLOSED: on an integrity failure this is the STATIC branded placeholder
     /// image — the tampered/unverified bytes are NEVER rendered as the image.
+    ///
+    /// Works in BOTH environments: a `blob:` URL in a browser, a `data:` URL in
+    /// Node.js (no `URL.createObjectURL`) — it never throws for the env.
     #[wasm_bindgen(js_name = resolveImageUrl)]
     pub async fn resolve_image_url(&self, urn: String) -> Result<String, JsError> {
         match do_resolve(
@@ -292,9 +296,9 @@ impl DigNetwork {
         )
         .await
         {
-            // The real, verified image bytes as a blob URL.
-            Ok(ResolveOutcome::Success(data)) => object_url(&data.bytes, &data.content_type)
-                .map_err(|e| JsError::new(&e.to_string())),
+            // The real, verified image bytes as an <img> URL (blob in a browser,
+            // data: URL in Node — never throws either way).
+            Ok(ResolveOutcome::Success(data)) => Ok(img_url(&data.bytes, &data.content_type)),
             // A non-success outcome → its branded error image (never the bytes).
             Ok(other) => Ok(crate::images::data_uri(crate::images::for_outcome(&other))),
             // A hard error → the matching branded error image (never throws here).
@@ -332,7 +336,27 @@ pub async fn resolve_object_url(
         .await
 }
 
-/// Build a `blob:` object URL from bytes + a MIME type.
+/// A usable `<img src>` URL for `bytes` + `content_type`, working in BOTH environments
+/// and never throwing:
+/// * **browser** — a `blob:` object URL via `URL.createObjectURL` (efficient; the
+///   caller revokes it);
+/// * **Node.js** (or any runtime without `Blob`/`createObjectURL`) — a
+///   `data:<mime>;base64,…` URL fallback.
+fn img_url(bytes: &[u8], content_type: &str) -> String {
+    match object_url(bytes, content_type) {
+        Ok(url) => url,
+        Err(_) => data_url(bytes, content_type),
+    }
+}
+
+/// A `data:<mime>;base64,…` URL — the environment-agnostic fallback.
+fn data_url(bytes: &[u8], content_type: &str) -> String {
+    let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+    format!("data:{content_type};base64,{b64}")
+}
+
+/// Build a `blob:` object URL from bytes + a MIME type. `Err` if the runtime lacks
+/// `Blob`/`URL.createObjectURL` (e.g. Node) — callers fall back to a `data:` URL.
 fn object_url(bytes: &[u8], content_type: &str) -> Result<String, TransportError> {
     let array = js_sys::Uint8Array::from(bytes);
     let parts = js_sys::Array::new();

@@ -676,6 +676,64 @@ async fn tampered_disk_cache_entry_fails_closed() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// --- Node vs browser env degradation ---------------------------------------
+
+#[tokio::test]
+async fn browser_cors_blocked_local_probe_falls_back_to_verified_rpc() {
+    // Simulate a BROWSER where the local-node `/health` + `/s/` probes throw
+    // (CORS-blocked) — every GET errors. The ladder must NOT hard-fail: it degrades
+    // to the VERIFIED rpc tier (never to unverified bytes).
+    let fx = build_fixture(IMG_KEY, b"rpc bytes", None);
+    let root = fx.root_hex.clone();
+    let t = MockTransport::new(
+        Box::new(|_u: &str| Err(transport_err())), // browser: local probe unavailable
+        Box::new(move |_u: &str, body: &str| {
+            let req: serde_json::Value = serde_json::from_str(body).unwrap();
+            match req["method"].as_str().unwrap() {
+                "dig.getContent" => Ok(rpc_ok(get_content_result(&fx))),
+                other => panic!("unexpected method {other}"),
+            }
+        }),
+    );
+    let data = success(
+        Resolver::new(t)
+            .resolve(&root_pinned_urn(IMG_KEY, &root))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(data.bytes, b"rpc bytes");
+}
+
+#[tokio::test]
+async fn unusable_cache_path_degrades_gracefully_never_throws() {
+    // A cache_path that can't be used (here: a path that is a FILE, not a directory —
+    // stands in for a no-filesystem/browser environment) must NOT throw: the disk
+    // layer is best-effort, so resolve still succeeds via memory + network.
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let not_a_dir = std::env::temp_dir().join(format!("dig-urn-resolver-notadir-{nanos}"));
+    std::fs::write(&not_a_dir, b"x").unwrap();
+
+    let fx = build_fixture(IMG_KEY, b"still resolves", None);
+    let root = fx.root_hex.clone();
+    let opts = ResolveOptions {
+        cache_path: Some(not_a_dir.to_string_lossy().to_string()),
+        ..Default::default()
+    };
+    let data = success(
+        Resolver::with_options(rpc_serving(fx), opts)
+            .resolve(&root_pinned_urn(IMG_KEY, &root))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(data.bytes, b"still resolves");
+
+    let _ = std::fs::remove_file(&not_a_dir);
+}
+
 fn base64_of(bytes: &[u8]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.encode(bytes)

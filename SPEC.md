@@ -148,12 +148,32 @@ document instead.
 Derived from the resource path extension first, then a magic-byte sniff, falling back
 to `application/octet-stream`. The node path prefers the response `Content-Type`.
 
-## 8. Transport
+## 8. Transport & environments
 
 The core logic depends only on an injected async transport (`HttpTransport`: `get`,
 `post_json`). Bundled implementations: `reqwest` (native, `native` feature) and the
-browser `fetch` (wasm, `wasm` feature). Node-class transports SHOULD use short
+browser `fetch` (wasm, `wasm` feature, resolved off `globalThis.fetch` so it works in
+a browser window, a worker, AND Node.js ≥18). Node-class transports SHOULD use short
 connect timeouts so dead ladder tiers fall through quickly.
+
+The wasm package (`@dignetwork/dig-urn-resolver`) MUST work in BOTH a browser and
+Node.js, degrading gracefully (never a hard env failure). The branded API + the three
+outcomes + MIME are IDENTICAL across environments; only env plumbing branches:
+
+- **Ladder** — a local-node `/health` probe that cannot run (e.g. CORS-blocked in a
+  browser) MUST NOT throw; the ladder catches it and falls through to the verified
+  rpc tier. A browser that can't reach a local node reaches the SAME fail-closed rpc
+  path, never unverified bytes.
+- **Cache (§11)** — the disk tier is native-only; in the wasm package a `cachePath`
+  MUST degrade to the in-memory cache without throwing.
+- **Image URL** — `resolveImageUrl` MUST return a usable URL in both: a `blob:` URL
+  where `URL.createObjectURL` exists, else a `data:` URL. `resolve()` (bytes +
+  `contentType`) MUST work regardless, so a consumer without blob-URL support can use
+  the bytes directly.
+
+The package ships a dual-target build: the wasm-bindgen `web` (ESM) build for browser
+bundlers and the `nodejs` (CommonJS) build for Node, routed by the package `exports`
+map (`browser`/`import` → web, `node`/`require` → node).
 
 ## 9. wasm surface (`@dignetwork/dig-urn-resolver`)
 

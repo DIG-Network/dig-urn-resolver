@@ -125,6 +125,32 @@ additive layer in front of resolve that never weakens fail-closed:
   path-traversal). Ignored in the browser (no filesystem); the memory cache still
   applies.
 
+## Runs in the browser AND Node.js
+
+The `@dignetwork/dig-urn-resolver` package is **dual-target** — one package that
+imports cleanly in both:
+
+```js
+// Browser bundler (Vite / webpack) — ESM
+import init, { DigNetwork } from "@dignetwork/dig-urn-resolver";
+await init();
+
+// Node.js service — CommonJS
+const { DigNetwork } = require("@dignetwork/dig-urn-resolver");
+```
+
+The branded `DigNetwork` API, the three fail-closed outcomes, and the MIME are
+IDENTICAL in both; only env-specific plumbing differs, and it degrades gracefully —
+never a hard-fail in either environment:
+
+- **Ladder** — the `dig.local`/`localhost` `/health` probe works in Node; in a
+  browser it's often CORS-blocked. The probe is caught/timed-out, so the ladder
+  simply falls through to the verified `rpc.dig.net` tier (never to unverified bytes).
+- **Cache** — the disk cache is native-only; in the wasm package (browser AND Node.js
+  JS) a `cachePath` is a harmless no-op and the bounded in-memory cache applies.
+- **Image URL** — `resolveImageUrl` returns a `blob:` URL where `URL.createObjectURL`
+  exists (browser) and a `data:` URL otherwise (Node.js) — always usable, never throws.
+
 ## Content type & the default view
 
 `contentType` is present on every `resolve` result: the store's stored
