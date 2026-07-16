@@ -1,0 +1,16 @@
+[package]
+name = "dig-urn-resolver"
+version = "0.1.0"
+edition = "2021"
+description = "Resolve a DIG URN to its data through the protocol (node-first ladder, verified + decrypted)."
+license = "GPL-2.0-only"
+authors = ["DIG Network"]
+repository = "https://github.com/DIG-Network/dig-urn-resolver"
+readme = "README.md"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+
+[dev-dependencies]
