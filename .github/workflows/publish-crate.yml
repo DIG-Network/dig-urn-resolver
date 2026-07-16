@@ -1,0 +1,101 @@
+# Publish dig-urn-resolver to crates.io.
+#
+# Triggers on the release.yml `v*` tag push (pushed with RELEASE_TOKEN so it fires
+# downstream workflows) — so ONE release ships both the npm wasm package (publish-npm.yml)
+# AND this crate together. A manual dispatch is offered for re-runs/repairs. Never on
+# `push: main`.
+#
+# Idempotent: skips the publish if this version is already on crates.io (a re-run of an
+# already-published tag no-ops green, never fails red). The publish itself is gated behind
+# fmt + clippy + test passing.
+#
+# Auth = `secrets.CARGO_REGISTRY_TOKEN` (a crates.io API token, org secret confirmed working
+# for digstore-core + chia-query). The pre-publish guard errors clearly if it is absent.
+name: Publish to crates.io
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gate:
+    name: Quality gate (fmt + clippy + test)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Tests
+        run: cargo test --all-features
+
+  publish:
+    name: Publish to crates.io
+    needs: gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Resolve crate version + skip if already published
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          VER="$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import sys,json; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "Local crate version: $VER"
+          PUBLISHED="$(curl -sS \
+            -H 'User-Agent: dig-urn-resolver-publish (github actions)' \
+            "https://crates.io/api/v1/crates/dig-urn-resolver/versions" \
+            | python3 -c 'import sys,json; d=json.load(sys.stdin); print("\n".join(v["num"] for v in d.get("versions",[])))' 2>/dev/null || echo "")"
+          if echo "$PUBLISHED" | grep -qx "$VER"; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "dig-urn-resolver $VER is already on crates.io — no-op."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Guard — CARGO_REGISTRY_TOKEN present
+        if: steps.ver.outputs.skip == 'false'
+        shell: bash
+        run: |
+          if [ -z "${{ secrets.CARGO_REGISTRY_TOKEN }}" ]; then
+            echo "::error::CARGO_REGISTRY_TOKEN secret is not set (or not scoped to this repo). Add a crates.io API token as the CARGO_REGISTRY_TOKEN repo/org secret, then re-run."
+            exit 1
+          fi
+
+      - name: Verify package (dry-run)
+        if: steps.ver.outputs.skip == 'false'
+        run: cargo publish --dry-run
+
+      - name: Publish
+        if: steps.ver.outputs.skip == 'false'
+        run: cargo publish --token "${{ secrets.CARGO_REGISTRY_TOKEN }}"
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
