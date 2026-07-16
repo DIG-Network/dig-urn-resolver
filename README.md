@@ -125,6 +125,37 @@ additive layer in front of resolve that never weakens fail-closed:
   path-traversal). Ignored in the browser (no filesystem); the memory cache still
   applies.
 
+Persistent disk caching is a **native (Rust) capability** — pass a `cache_path` in
+`ResolveOptions`, and verified results survive across process runs (a long-lived
+on-disk cache under the given directory). Because URNs are immutable + content-
+addressed, a later run re-serves a cached asset without a network round-trip, and
+every disk hit is still re-verified against the URN's root before use:
+
+```rust
+use dig_urn_resolver::{native, ResolveOptions, ResolveOutcome};
+
+#[tokio::main]
+async fn main() {
+    let options = ResolveOptions {
+        cache_path: Some("/var/cache/dig-urn".into()), // long-lived disk cache
+        ..Default::default()
+    };
+    match native::resolve_with("urn:dig:chia:<store>:<root>/img/logo.png", options)
+        .await
+        .unwrap()
+    {
+        ResolveOutcome::Success(data) => { /* served from disk on a later run */ }
+        ResolveOutcome::IntegrityFailure => { /* re-verify failed — never served */ }
+        ResolveOutcome::Unreachable => { /* network down — offer "connect a node" */ }
+    }
+}
+```
+
+In the `@dignetwork/dig-urn-resolver` wasm package the constructor's `cachePath`
+argument is accepted but is a **harmless no-op** in BOTH the browser AND Node.js
+(the JS build has no filesystem access) — the bounded in-memory cache applies there.
+The persistent disk cache above is available only to native Rust consumers.
+
 ## Runs in the browser AND Node.js
 
 The `@dignetwork/dig-urn-resolver` package is **dual-target** — one package that
