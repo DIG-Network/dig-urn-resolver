@@ -47,6 +47,8 @@ pub mod error;
 pub mod images;
 pub mod ladder;
 pub mod node;
+#[cfg(all(feature = "wasm", not(feature = "native")))]
+pub mod node_fs;
 pub mod pages;
 pub mod resolver;
 pub mod rpc;

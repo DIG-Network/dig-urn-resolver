@@ -118,12 +118,12 @@ additive layer in front of resolve that never weakens fail-closed:
   URN→bytes mapping.
 - **Memory (default, bounded LRU):** process-trusted (only holds what this process
   verified this run) — a hit skips re-verification.
-- **Disk (optional `cachePath`, native):** UNTRUSTED — it stores the *verifiable
-  artifacts* (ciphertext + proof + chunk lengths), and a disk hit is **re-verified**
-  against the URN's root before use, so a tampered on-disk file FAILS verification →
-  `IntegrityFailure` (never served). Filenames are `SHA-256(identity)` (no
-  path-traversal). Ignored in the browser (no filesystem); the memory cache still
-  applies.
+- **Disk (optional `cachePath`; native Rust AND Node.js):** UNTRUSTED — it stores the
+  *verifiable artifacts* (ciphertext + proof + chunk lengths), and a disk hit is
+  **re-verified** against the URN's root before use, so a tampered on-disk file FAILS
+  verification → `IntegrityFailure` (never served). Filenames are `SHA-256(identity)`
+  (no path-traversal). Ignored clientside in the browser (no filesystem); the memory
+  cache still applies there.
 
 Persistent disk caching is a **native (Rust) capability** — pass a `cache_path` in
 `ResolveOptions`, and verified results survive across process runs (a long-lived
@@ -151,25 +151,27 @@ async fn main() {
 }
 ```
 
-In the `@dignetwork/dig-urn-resolver` wasm package the constructor takes the same
-`cachePath` as its third argument:
+In the `@dignetwork/dig-urn-resolver` wasm package the `DigNetwork` constructor takes
+the same `cachePath` as its third argument, and it is **fully functional under
+Node.js** — the Node build injects Node's `fs`, so verified results persist to the
+given directory and are re-verified on read, exactly like the native crate:
 
 ```js
-// Node.js service (CommonJS) — persist a long-lived resolver instance
+// Node.js service (CommonJS) — a persistent, cross-run disk cache
 const { DigNetwork } = require("@dignetwork/dig-urn-resolver");
 
 //                         endpoint  connectUrl  cachePath
 const dig = new DigNetwork(undefined, undefined, "/var/cache/dig-urn");
 
+// First run fetches + verifies; a later run (same cachePath) re-serves from disk.
 const img = await dig.resolveImageUrl("urn:dig:chia:<store>:<root>/img/logo.png");
 ```
 
-The `cachePath` argument is accepted for API symmetry with the native crate but is
-currently a **harmless no-op** in BOTH the browser AND Node.js (the wasm build has
-no filesystem access), so the bounded in-memory cache applies there — a hit within
-the same process still skips re-verification. Persistent, cross-run disk caching is
-today a native (Rust) capability only (the example above). (Functional Node.js disk
-caching is tracked separately.)
+**Clientside (browser) `cachePath` is a harmless no-op** — a browser has no
+filesystem, so the wasm build never wires `fs` there and the bounded in-memory cache
+applies instead (a same-process hit still skips re-verification). The persistent disk
+cache is available to native Rust consumers AND to the Node.js build; only the browser
+falls back to memory-only.
 
 ## Runs in the browser AND Node.js
 
@@ -192,8 +194,9 @@ never a hard-fail in either environment:
 - **Ladder** — the `dig.local`/`localhost` `/health` probe works in Node; in a
   browser it's often CORS-blocked. The probe is caught/timed-out, so the ladder
   simply falls through to the verified `rpc.dig.net` tier (never to unverified bytes).
-- **Cache** — the disk cache is native-only; in the wasm package (browser AND Node.js
-  JS) a `cachePath` is a harmless no-op and the bounded in-memory cache applies.
+- **Cache** — the disk `cachePath` works natively AND under Node.js (the Node build
+  injects `fs`); in a browser there is no filesystem, so `cachePath` is a harmless
+  no-op and the bounded in-memory cache applies.
 - **Image URL** — `resolveImageUrl` returns a `blob:` URL where `URL.createObjectURL`
   exists (browser) and a `data:` URL otherwise (Node.js) — always usable, never throws.
 

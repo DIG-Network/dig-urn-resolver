@@ -141,11 +141,18 @@ pub const DEFAULT_MEMORY_ENTRIES: usize = 256;
 pub const DEFAULT_MEMORY_BYTES: usize = 32 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
-// Disk cache (native only, UNTRUSTED storage — always re-verified on read)
+// Disk cache (UNTRUSTED storage — always re-verified on read)
+//
+// Two backends behind ONE interface (`new`/`get`/`put`/`remove`): `std::fs` for the
+// native build, and Node's `fs` (via the injected `node_fs` seam) for the wasm build
+// running under Node. In the browser the wasm backend is inert — see `node_fs`.
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "native")]
 pub use disk::DiskCache;
+
+#[cfg(all(feature = "wasm", not(feature = "native")))]
+pub use disk_wasm::DiskCache;
 
 #[cfg(feature = "native")]
 mod disk {
@@ -191,6 +198,57 @@ mod disk {
         /// Remove a (failed-verification / stale) entry, best-effort.
         pub fn remove(&self, id: &str) {
             let _ = std::fs::remove_file(self.path(id));
+        }
+    }
+}
+
+#[cfg(all(feature = "wasm", not(feature = "native")))]
+mod disk_wasm {
+    use super::DiskArtifacts;
+    use crate::node_fs;
+    use digstore_core::hash::sha256;
+
+    /// A content-addressed disk cache backed by Node's `fs` (the wasm build). Mirrors
+    /// the native [`super::disk::DiskCache`] byte-for-byte on disk (a `SHA-256(id).json`
+    /// envelope of [`DiskArtifacts`]), so the two backends are interchangeable and a
+    /// cache written by one is readable by the other. UNTRUSTED: every read is
+    /// re-verified by the caller against the URN's root. In the browser, `node_fs` is
+    /// inert, so `get` always misses and `put`/`remove` are no-ops.
+    pub struct DiskCache {
+        dir: String,
+    }
+
+    impl DiskCache {
+        /// Open (creating the directory under Node) a disk cache rooted at `dir`.
+        pub fn new(dir: impl AsRef<str>) -> Self {
+            let dir = dir.as_ref().trim_end_matches('/').to_string();
+            node_fs::mkdir_all(&dir);
+            DiskCache { dir }
+        }
+
+        /// The content-addressed file path for an identity — `SHA-256(id)` hex, so a
+        /// malicious URN can never traverse out of the cache directory.
+        fn path(&self, id: &str) -> String {
+            format!("{}/{}.json", self.dir, sha256(id.as_bytes()).to_hex())
+        }
+
+        /// Load the stored artifacts for `id`, or `None` on miss / unreadable /
+        /// malformed (a corrupt envelope is a miss, not a crash).
+        pub fn get(&self, id: &str) -> Option<DiskArtifacts> {
+            let raw = node_fs::read_file(&self.path(id))?;
+            serde_json::from_slice(&raw).ok()
+        }
+
+        /// Persist the verifiable artifacts for `id` (best-effort; ignore I/O errors).
+        pub fn put(&self, id: &str, artifacts: &DiskArtifacts) {
+            if let Ok(bytes) = serde_json::to_vec(artifacts) {
+                node_fs::write_file(&self.path(id), &bytes);
+            }
+        }
+
+        /// Remove a (failed-verification / stale) entry, best-effort.
+        pub fn remove(&self, id: &str) {
+            node_fs::remove_file(&self.path(id));
         }
     }
 }
