@@ -151,10 +151,25 @@ async fn main() {
 }
 ```
 
-In the `@dignetwork/dig-urn-resolver` wasm package the constructor's `cachePath`
-argument is accepted but is a **harmless no-op** in BOTH the browser AND Node.js
-(the JS build has no filesystem access) — the bounded in-memory cache applies there.
-The persistent disk cache above is available only to native Rust consumers.
+In the `@dignetwork/dig-urn-resolver` wasm package the constructor takes the same
+`cachePath` as its third argument:
+
+```js
+// Node.js service (CommonJS) — persist a long-lived resolver instance
+const { DigNetwork } = require("@dignetwork/dig-urn-resolver");
+
+//                         endpoint  connectUrl  cachePath
+const dig = new DigNetwork(undefined, undefined, "/var/cache/dig-urn");
+
+const img = await dig.resolveImageUrl("urn:dig:chia:<store>:<root>/img/logo.png");
+```
+
+The `cachePath` argument is accepted for API symmetry with the native crate but is
+currently a **harmless no-op** in BOTH the browser AND Node.js (the wasm build has
+no filesystem access), so the bounded in-memory cache applies there — a hit within
+the same process still skips re-verification. Persistent, cross-run disk caching is
+today a native (Rust) capability only (the example above). (Functional Node.js disk
+caching is tracked separately.)
 
 ## Runs in the browser AND Node.js
 
