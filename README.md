@@ -4,6 +4,17 @@ Resolve a DIG URN to its data through the protocol, **node-first**. A Rust crate
 a `@dignetwork/dig-urn-resolver` wasm/npm package. First consumer: **Sage wallet NFT
 images**.
 
+## Positioning — the canonical client-side URN resolver
+
+This is **THE** canonical, project-wide client-side URN→data resolver (the #668
+convergence: hub, the extension, dig-sdk, dig-dns and other consumers converge on
+it). It sits strictly **upstream of dig-node**: it is a *client* that talks to a
+dig-node over the wire (the node `/s/` + `/health` surface, else the `rpc.dig.net`
+gateway) — dig-node does all the heavy lifting (store sync, serve, decrypt, chain
+anchoring) and **never depends on this crate**. Consume it from Rust (`dig-urn-resolver`)
+or JS/wasm (`@dignetwork/dig-urn-resolver`); do not reimplement URN resolution
+elsewhere.
+
 Given a URN of the form
 
 ```

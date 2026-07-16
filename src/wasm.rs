@@ -145,23 +145,50 @@ fn connect_or_default(connect_url: Option<String>) -> String {
     opt(connect_url).unwrap_or_else(|| crate::pages::DEFAULT_CONNECT_URL.to_string())
 }
 
-/// Shape an outcome into the JS object `{ outcome, bytes, contentType }`. For a
-/// non-success outcome `bytes` is the branded page (never unverified content).
-fn outcome_to_js(outcome: &ResolveOutcome, connect_url: &str) -> JsValue {
+/// The typed result of [`DigNetwork::resolve`]: the outcome tag, the bytes, and —
+/// on EVERY result — the MIME/content type. For a non-success outcome the bytes are
+/// the branded `text/html` page (never unverified content) and `contentType` is
+/// `text/html`; for a success they are the resolved resource + its type (the store's
+/// stored `Content-Type` on the node path, else inferred from the URN path extension
+/// / magic bytes). A consumer (e.g. the hub serving a dig-protocol resource) can set
+/// the right response `Content-Type` header straight from `.contentType`.
+#[wasm_bindgen]
+pub struct ResolveResult {
+    outcome: String,
+    bytes: Vec<u8>,
+    content_type: String,
+}
+
+#[wasm_bindgen]
+impl ResolveResult {
+    /// `"success"` | `"integrity_failure"` | `"unreachable"`.
+    #[wasm_bindgen(getter)]
+    pub fn outcome(&self) -> String {
+        self.outcome.clone()
+    }
+
+    /// The resource bytes (or the branded page for a non-success outcome).
+    #[wasm_bindgen(getter)]
+    pub fn bytes(&self) -> Vec<u8> {
+        self.bytes.clone()
+    }
+
+    /// The MIME/content type — present on EVERY result.
+    #[wasm_bindgen(getter, js_name = contentType)]
+    pub fn content_type(&self) -> String {
+        self.content_type.clone()
+    }
+}
+
+/// Shape an outcome into the typed [`ResolveResult`]. For a non-success outcome the
+/// bytes are the branded page (never unverified content); `contentType` is always set.
+fn outcome_to_result(outcome: &ResolveOutcome, connect_url: &str) -> ResolveResult {
     let rendered = outcome.render(connect_url);
-    let obj = js_sys::Object::new();
-    set(&obj, "outcome", &JsValue::from_str(outcome.kind()));
-    set(
-        &obj,
-        "bytes",
-        &js_sys::Uint8Array::from(rendered.bytes.as_slice()),
-    );
-    set(
-        &obj,
-        "contentType",
-        &JsValue::from_str(&rendered.content_type),
-    );
-    obj.into()
+    ResolveResult {
+        outcome: outcome.kind().to_string(),
+        bytes: rendered.bytes,
+        content_type: rendered.content_type,
+    }
 }
 
 /// Shape an outcome into a `blob:` object URL. `render` is the ONLY byte source, so
@@ -209,17 +236,17 @@ impl DigNetwork {
         }
     }
 
-    /// Resolve a DIG URN to a typed outcome: `{ outcome, bytes: Uint8Array,
-    /// contentType: string }`, `outcome ∈ "success" | "integrity_failure" |
+    /// Resolve a DIG URN to a typed [`ResolveResult`] (`outcome`, `bytes`, and — on
+    /// EVERY result — `contentType`). `outcome ∈ "success" | "integrity_failure" |
     /// "unreachable"`. For a non-success outcome `bytes` is the branded `text/html`
     /// page, never unverified content. Rejects only on a hard error (bad URN,
     /// not-found, reachable rpc protocol error, or a rootless URN over the gateway).
-    pub async fn resolve(&self, urn: String) -> Result<JsValue, JsError> {
+    pub async fn resolve(&self, urn: String) -> Result<ResolveResult, JsError> {
         let (endpoint, connect) = (self.endpoint.clone(), self.connect_url.clone());
         let outcome = do_resolve(urn, endpoint, connect.clone())
             .await
             .map_err(|e| JsError::new(&e.to_string()))?;
-        Ok(outcome_to_js(&outcome, &connect_or_default(connect)))
+        Ok(outcome_to_result(&outcome, &connect_or_default(connect)))
     }
 
     /// Resolve a DIG URN to a `blob:` object URL usable directly as an `<img src>` —
@@ -240,13 +267,13 @@ impl DigNetwork {
 // Low-level free functions (the branded `DigNetwork` above is the front door)
 // ---------------------------------------------------------------------------
 
-/// Low-level: resolve to `{ outcome, bytes, contentType }`. Prefer [`DigNetwork`].
+/// Low-level: resolve to a typed [`ResolveResult`]. Prefer [`DigNetwork`].
 #[wasm_bindgen]
 pub async fn resolve(
     urn: String,
     endpoint: Option<String>,
     connect_url: Option<String>,
-) -> Result<JsValue, JsError> {
+) -> Result<ResolveResult, JsError> {
     DigNetwork::new(endpoint, connect_url).resolve(urn).await
 }
 
@@ -272,10 +299,6 @@ fn object_url(bytes: &[u8], content_type: &str) -> Result<String, TransportError
     let blob =
         web_sys::Blob::new_with_u8_array_sequence_and_options(&parts, &bag).map_err(js_err)?;
     web_sys::Url::create_object_url_with_blob(&blob).map_err(js_err)
-}
-
-fn set(obj: &js_sys::Object, key: &str, value: &JsValue) {
-    let _ = js_sys::Reflect::set(obj, &JsValue::from_str(key), value);
 }
 
 /// The crate version, for SRI / compatibility checks.
