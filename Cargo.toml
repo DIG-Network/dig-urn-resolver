@@ -1,6 +1,6 @@
 [package]
 name = "dig-urn-resolver"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.75.0"
 description = "Resolve a DIG URN to its data through the protocol (node-first ladder, verified + decrypted). Rust + wasm; first consumer: Sage wallet NFT images."
@@ -24,6 +24,7 @@ wasm = [
   "dep:wasm-bindgen-futures",
   "dep:js-sys",
   "dep:web-sys",
+  "dep:serde-wasm-bindgen",
 ]
 
 [dependencies]
@@ -50,6 +51,9 @@ url = { version = "2", optional = true }
 
 # wasm transport + bindings (feature `wasm`)
 wasm-bindgen = { version = "0.2", optional = true }
+# Deserializes the `DigNetwork` options object (a typed JS object) into the Rust
+# option fields, so the constructor takes named fields, not positional args.
+serde-wasm-bindgen = { version = "0.6", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
 js-sys = { version = "0.3", optional = true }
 web-sys = { version = "0.3", optional = true, features = [
