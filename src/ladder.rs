@@ -71,9 +71,21 @@ impl Endpoint {
 
 /// Extract the host (no scheme, path, or port) from a base URL. Handles the
 /// `[ipv6]:port` bracket form and `host:port`.
+///
+/// SECURITY: any `user:pass@` userinfo is stripped FIRST, so the returned host is the
+/// real connect target — the part AFTER the last `@` — exactly what `reqwest`/the url
+/// crate dial. Without this, `http://127.0.0.1:9778@evil.com/` would parse a loopback
+/// "host" while the transport connects to `evil.com`, re-opening the crypto-free node
+/// trust bypass (a URL-confusion integrity bypass).
 pub fn host_of(base: &str) -> &str {
     let after_scheme = base.split("://").nth(1).unwrap_or(base);
     let authority = after_scheme.split('/').next().unwrap_or(after_scheme);
+    // Drop userinfo: the true host is after the LAST '@' ('@' inside userinfo must be
+    // percent-encoded, so the last '@' delimits userinfo from host).
+    let authority = match authority.rsplit_once('@') {
+        Some((_userinfo, host)) => host,
+        None => authority,
+    };
     if let Some(rest) = authority.strip_prefix('[') {
         // `[ipv6]:port` → the bracketed address.
         return rest.split(']').next().unwrap_or(rest);
@@ -185,6 +197,34 @@ mod tests {
         assert_eq!(host_of("http://[::1]:9778"), "::1");
         assert_eq!(host_of("https://rpc.dig.net"), "rpc.dig.net");
         assert_eq!(host_of("http://evil.example.com/path"), "evil.example.com");
+    }
+
+    #[test]
+    fn host_of_strips_userinfo_to_the_real_connect_target() {
+        // The transport connects to the host AFTER the last '@'; the classifier must
+        // see the SAME host, never the loopback-looking userinfo.
+        assert_eq!(host_of("http://127.0.0.1:9778@evil.com/"), "evil.com");
+        assert_eq!(host_of("http://localhost:9778@evil.com"), "evil.com");
+        assert_eq!(host_of("http://[::1]@evil.com"), "evil.com");
+        assert_eq!(host_of("http://user:pass@evil.com:1234/x"), "evil.com");
+        // Legitimate userinfo in front of a real loopback host still resolves to it.
+        assert_eq!(host_of("http://user:pass@127.0.0.1:9778"), "127.0.0.1");
+    }
+
+    #[test]
+    fn userinfo_confusion_urls_are_never_node_trusted() {
+        // F1 gate: a loopback-looking userinfo must NOT grant crypto-free node trust
+        // when the real connect target is remote.
+        assert_eq!(
+            classify("http://127.0.0.1:9778@evil.com").kind,
+            EndpointKind::Rpc
+        );
+        assert_eq!(
+            classify("http://localhost:9778@evil.com").kind,
+            EndpointKind::Rpc
+        );
+        assert_eq!(classify("http://[::1]@evil.com").kind, EndpointKind::Rpc);
+        assert!(!is_loopback_host(host_of("http://127.0.0.1:9778@evil.com")));
     }
 
     #[test]

@@ -22,10 +22,11 @@
 //! inclusion_proof, chunk_lens}` (base64 ciphertext + proof), paged by
 //! `next_offset`/`complete`.
 
+use crate::cache::DiskArtifacts;
 use crate::content_type;
 use crate::crypto;
 use crate::error::{ResolveError, Result};
-use crate::resolver::ResolvedData;
+use crate::resolver::{Fetched, ResolvedData};
 use crate::transport::HttpTransport;
 use crate::urn::ParsedUrn;
 use base64::Engine;
@@ -35,6 +36,17 @@ use serde_json::json;
 /// The backend caps each `dig.getContent` window (Lambda/APIGW response ceiling);
 /// the client loops windows until `complete`.
 const RPC_WINDOW_BYTES: u64 = 3 * 1024 * 1024;
+
+/// Availability guard: the largest resource this resolver will assemble from the
+/// UNTRUSTED gateway. Bounds the `total_length` the gateway can make us pre-reserve /
+/// accumulate, so a crafted `~u64::MAX` cannot trigger a capacity-overflow abort in a
+/// wallet-embedded build. 64 MiB comfortably covers display assets (images/NFTs).
+const MAX_RESOURCE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Availability guard: the maximum number of `dig.getContent` windows for one fetch,
+/// so a gateway that keeps advancing `next_offset` by 1 cannot loop the client
+/// forever. Bounded by the byte cap and the window size, with slack.
+const MAX_WINDOWS: usize = (MAX_RESOURCE_BYTES / RPC_WINDOW_BYTES) as usize + 16;
 
 #[derive(Deserialize)]
 struct GetContent {
@@ -105,11 +117,11 @@ fn trusted_root(parsed: &ParsedUrn) -> Result<String> {
 
 /// Fetch a resource over the rpc gateway: take the pinned root, stream the windowed
 /// ciphertext, then verify (fail-closed) + decrypt.
-pub async fn fetch<T: HttpTransport + ?Sized>(
+pub(crate) async fn fetch<T: HttpTransport + ?Sized>(
     transport: &T,
     base: &str,
     parsed: &ParsedUrn,
-) -> Result<ResolvedData> {
+) -> Result<Fetched> {
     let base = base.trim_end_matches('/');
     let root = trusted_root(parsed)?;
     let retrieval_key = parsed.retrieval_key_hex();
@@ -119,8 +131,16 @@ pub async fn fetch<T: HttpTransport + ?Sized>(
     let mut proof = String::new();
     let mut chunk_lens: Vec<u32> = Vec::new();
     let mut offset: u64 = 0;
+    let mut windows: usize = 0;
 
     loop {
+        // Availability: bound the number of windows the untrusted gateway can make us
+        // loop (e.g. advancing next_offset by 1 forever).
+        windows += 1;
+        if windows > MAX_WINDOWS {
+            return Err(ResolveError::Rpc("too many content windows".into()));
+        }
+
         let r: GetContent = rpc_call(
             transport,
             base,
@@ -139,9 +159,16 @@ pub async fn fetch<T: HttpTransport + ?Sized>(
             if r.total_length == 0 {
                 return Err(ResolveError::NotFound);
             }
+            // Clamp the UNTRUSTED total before any reserve, so a crafted ~u64::MAX
+            // cannot overflow the allocation (panic=abort would crash the wallet).
+            if r.total_length > MAX_RESOURCE_BYTES {
+                return Err(ResolveError::Rpc("resource exceeds maximum size".into()));
+            }
             total = Some(r.total_length);
-            buf.reserve(r.total_length as usize);
+            buf.reserve(r.total_length as usize); // bounded ≤ MAX_RESOURCE_BYTES
         }
+        let total_len = total.unwrap();
+
         if chunk_lens.is_empty() {
             if let Some(lens) = &r.chunk_lens {
                 chunk_lens = lens.clone();
@@ -151,6 +178,12 @@ pub async fn fetch<T: HttpTransport + ?Sized>(
             let chunk = base64::engine::general_purpose::STANDARD
                 .decode(ct_b64.trim().as_bytes())
                 .map_err(|_| ResolveError::Rpc("ciphertext is not valid base64".into()))?;
+            // Never accumulate more than the (clamped) declared total.
+            if buf.len() as u64 + chunk.len() as u64 > total_len {
+                return Err(ResolveError::Rpc(
+                    "gateway returned more bytes than declared".into(),
+                ));
+            }
             buf.extend_from_slice(&chunk);
         }
         if let Some(p) = &r.inclusion_proof {
@@ -162,11 +195,28 @@ pub async fn fetch<T: HttpTransport + ?Sized>(
         let _ = r.offset; // window offset echo; the client tracks its own cursor.
         match (r.complete, r.next_offset) {
             (Some(true), _) | (_, None) => break,
-            (_, Some(next)) => offset = next,
+            (_, Some(next)) => {
+                // Offset MUST advance monotonically, else the gateway could loop us.
+                if next <= offset {
+                    return Err(ResolveError::Rpc("content offset did not advance".into()));
+                }
+                offset = next;
+            }
         }
     }
 
     let bytes = crypto::verify_and_decrypt(parsed, &buf, &proof, &root, &chunk_lens)?;
     let content_type = content_type::derive(parsed.resource_key(), &bytes);
-    Ok(ResolvedData::new(bytes, content_type))
+    Ok(Fetched {
+        data: ResolvedData::new(bytes, content_type),
+        root: Some(root),
+        // The verifiable artifacts, so a disk-cache hit can be RE-VERIFIED (never
+        // trusted blindly): a tampered on-disk ciphertext/proof fails the same merkle
+        // gate on read.
+        artifacts: Some(DiskArtifacts {
+            ciphertext: buf,
+            proof_b64: proof,
+            chunk_lens,
+        }),
+    })
 }

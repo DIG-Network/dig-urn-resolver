@@ -61,6 +61,32 @@ pub fn node_response(body: Vec<u8>, content_type: Option<&str>, verified: bool) 
     resp
 }
 
+/// A dig-node CIPHERTEXT `/s/` response (blind node path): the raw ciphertext body +
+/// the `X-Dig-*` headers the client needs to verify+decrypt it (mirrors the rpc
+/// artifacts). Uses the fixture's real ciphertext + proof + root.
+pub fn node_ciphertext_response(fx: &RpcFixture) -> HttpResponse {
+    use base64::Engine;
+    let body = base64::engine::general_purpose::STANDARD
+        .decode(fx.ciphertext_b64.trim())
+        .unwrap();
+    let chunk_lens = fx
+        .chunk_lens
+        .iter()
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    HttpResponse {
+        status: 200,
+        headers: vec![
+            ("x-dig-encrypted".to_string(), "true".to_string()),
+            ("x-dig-inclusion-proof".to_string(), fx.proof_b64.clone()),
+            ("x-dig-root".to_string(), fx.root_hex.clone()),
+            ("x-dig-chunk-lens".to_string(), chunk_lens),
+        ],
+        body,
+    }
+}
+
 /// A bare status response with no body.
 pub fn status(code: u16) -> HttpResponse {
     HttpResponse {

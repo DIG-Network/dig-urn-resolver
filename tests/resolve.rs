@@ -83,13 +83,27 @@ async fn rejects_non_urn() {
 }
 
 #[tokio::test]
-async fn rejects_urn_without_resource_path() {
-    let t = node_serving(vec![], "text/plain");
-    let err = Resolver::new(t)
-        .resolve(&format!("urn:dig:chia:{STORE_HEX}"))
-        .await
-        .unwrap_err();
-    assert!(matches!(err, ResolveError::Parse(_)));
+async fn bare_store_urn_defaults_to_index_html() {
+    // §8.5: a bare store URN (no resource path) resolves to the default view
+    // index.html — the node is asked for `/s/<store>/index.html`.
+    let t = MockTransport::new(
+        Box::new(|url: &str| {
+            if url.ends_with("/health") {
+                Ok(status(200))
+            } else {
+                assert!(url.ends_with("/index.html"), "default view: {url}");
+                Ok(node_response(b"landing".to_vec(), Some("text/html"), true))
+            }
+        }),
+        Box::new(|_u, _b| Err(transport_err())),
+    );
+    let data = success(
+        Resolver::new(t)
+            .resolve(&format!("urn:dig:chia:{STORE_HEX}"))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(data.bytes, b"landing");
 }
 
 // --- ladder: node preferred when healthy -----------------------------------
@@ -458,6 +472,208 @@ fn outcome_accessors() {
     let rendered = ok.render("https://dig.net");
     assert_eq!(rendered.bytes, vec![1, 2]);
     assert_eq!(rendered.content_type, "image/png");
+}
+
+// --- node CIPHERTEXT path (client verify+decrypt, salt on both tiers) ------
+
+#[tokio::test]
+async fn node_ciphertext_response_is_verified_and_decrypted() {
+    // A loopback node that returns CIPHERTEXT (not plaintext) must be client-side
+    // verified + decrypted, NOT trusted blindly.
+    let fx = build_fixture(IMG_KEY, b"\x89PNG node ciphertext", None);
+    let root = fx.root_hex.clone();
+    let t = MockTransport::new(
+        Box::new(move |url: &str| {
+            if url.ends_with("/health") {
+                Ok(status(200))
+            } else {
+                Ok(node_ciphertext_response(&fx))
+            }
+        }),
+        Box::new(|_u, _b| Err(transport_err())),
+    );
+    let data = success(
+        Resolver::new(t)
+            .resolve(&root_pinned_urn(IMG_KEY, &root))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(data.bytes, b"\x89PNG node ciphertext");
+}
+
+#[tokio::test]
+async fn salted_urn_decrypts_on_node_ciphertext_path() {
+    let salt = "cd".repeat(32);
+    let fx = build_fixture(IMG_KEY, b"salted node art", Some(&salt));
+    let root = fx.root_hex.clone();
+    let t = MockTransport::new(
+        Box::new(move |url: &str| {
+            if url.ends_with("/health") {
+                Ok(status(200))
+            } else {
+                Ok(node_ciphertext_response(&fx))
+            }
+        }),
+        Box::new(|_u, _b| Err(transport_err())),
+    );
+    let data = success(
+        Resolver::new(t)
+            .resolve(&format!(
+                "{}?salt={}",
+                root_pinned_urn(IMG_KEY, &root),
+                salt
+            ))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(data.bytes, b"salted node art");
+}
+
+#[tokio::test]
+async fn wrong_salt_on_node_ciphertext_path_is_integrity_failure() {
+    // Ciphertext committed WITHOUT salt; resolved WITH a salt over the node
+    // ciphertext path → decrypt tag fails → fail-closed IntegrityFailure.
+    let fx = build_fixture(IMG_KEY, b"art", None);
+    let root = fx.root_hex.clone();
+    let t = MockTransport::new(
+        Box::new(move |url: &str| {
+            if url.ends_with("/health") {
+                Ok(status(200))
+            } else {
+                Ok(node_ciphertext_response(&fx))
+            }
+        }),
+        Box::new(|_u, _b| Err(transport_err())),
+    );
+    let wrong = "ef".repeat(32);
+    let outcome = Resolver::new(t)
+        .resolve(&format!(
+            "{}?salt={}",
+            root_pinned_urn(IMG_KEY, &root),
+            wrong
+        ))
+        .await
+        .unwrap();
+    assert_eq!(outcome, ResolveOutcome::IntegrityFailure);
+}
+
+// --- caching ---------------------------------------------------------------
+
+#[tokio::test]
+async fn second_resolve_is_a_memory_cache_hit_no_network() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let fx = build_fixture(IMG_KEY, b"cached bytes", None);
+    let root = fx.root_hex.clone();
+    let calls = Rc::new(Cell::new(0u32));
+    let c = calls.clone();
+    let t = MockTransport::new(
+        Box::new(|_u: &str| Err(transport_err())), // no node
+        Box::new(move |_u: &str, _b: &str| {
+            let n = c.get() + 1;
+            c.set(n);
+            assert!(n == 1, "2nd network call — expected a cache hit");
+            Ok(rpc_ok(get_content_result(&fx)))
+        }),
+    );
+    let r = Resolver::new(t);
+    let urn = root_pinned_urn(IMG_KEY, &root);
+    assert_eq!(
+        success(r.resolve(&urn).await.unwrap()).bytes,
+        b"cached bytes"
+    );
+    assert_eq!(
+        success(r.resolve(&urn).await.unwrap()).bytes,
+        b"cached bytes"
+    );
+    assert_eq!(calls.get(), 1, "exactly one network fetch");
+}
+
+#[tokio::test]
+async fn failures_are_not_cached_and_recovery_retries() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let fx = build_fixture(IMG_KEY, b"recovered", None);
+    let root = fx.root_hex.clone();
+    let up = Rc::new(Cell::new(false));
+    let up2 = up.clone();
+    let t = MockTransport::new(
+        Box::new(|_u: &str| Err(transport_err())),
+        Box::new(move |_u: &str, _b: &str| {
+            if up2.get() {
+                Ok(rpc_ok(get_content_result(&fx)))
+            } else {
+                Err(transport_err())
+            }
+        }),
+    );
+    let r = Resolver::new(t);
+    let urn = root_pinned_urn(IMG_KEY, &root);
+    // Network down → Unreachable, and it MUST NOT be cached.
+    assert_eq!(r.resolve(&urn).await.unwrap(), ResolveOutcome::Unreachable);
+    // Network recovers → a real retry (not a cached failure) → Success.
+    up.set(true);
+    assert_eq!(success(r.resolve(&urn).await.unwrap()).bytes, b"recovered");
+}
+
+#[tokio::test]
+async fn tampered_disk_cache_entry_fails_closed() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("dig-urn-resolver-disk-{nanos}"));
+    let dir_str = dir.to_string_lossy().to_string();
+
+    let fx = build_fixture(IMG_KEY, b"disk bytes", None);
+    let root = fx.root_hex.clone();
+    let urn = root_pinned_urn(IMG_KEY, &root);
+
+    // (1) Populate the disk cache with the verifiable artifacts.
+    {
+        let opts = ResolveOptions {
+            cache_path: Some(dir_str.clone()),
+            ..Default::default()
+        };
+        let d = success(
+            Resolver::with_options(rpc_serving(fx), opts)
+                .resolve(&urn)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(d.bytes, b"disk bytes");
+    }
+
+    // (2) TAMPER the on-disk ciphertext (leave the proof intact).
+    let file = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.extension().and_then(|x| x.to_str()) == Some("json"))
+        .expect("a disk cache entry was written");
+    let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    v["ciphertext"] = serde_json::json!([9, 9, 9, 9, 9, 9]);
+    std::fs::write(&file, serde_json::to_vec(&v).unwrap()).unwrap();
+
+    // (3) A FRESH resolver (empty memory) whose transport PANICS on any network —
+    // it must serve from disk, RE-VERIFY, catch the tamper, and fail closed.
+    let t = MockTransport::new(
+        Box::new(|u: &str| panic!("must not hit the network (disk hit): {u}")),
+        Box::new(|u: &str, _b: &str| panic!("must not hit the network (disk hit): {u}")),
+    );
+    let opts = ResolveOptions {
+        cache_path: Some(dir_str),
+        ..Default::default()
+    };
+    let outcome = Resolver::with_options(t, opts).resolve(&urn).await.unwrap();
+    assert_eq!(
+        outcome,
+        ResolveOutcome::IntegrityFailure,
+        "tampered disk bytes must fail closed, never be served"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 fn base64_of(bytes: &[u8]) -> String {

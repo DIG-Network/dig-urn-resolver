@@ -28,8 +28,9 @@ urn:dig:chia:<store_id>[:<root>]/<resource_key>[?salt=<hex>]
 - `store_id` — 64 lowercase hex chars (singleton launcher id). REQUIRED.
 - `root` — OPTIONAL 64 hex chars pinning one on-chain generation. The root is the
   trust anchor for inclusion verification ONLY; it is NOT a key input.
-- `resource_key` — the path within the store. REQUIRED for a resolve (a bare store
-  URN with no `/path` is rejected). An empty key resolves to `index.html` (§8.5).
+- `resource_key` — the path within the store. An ABSENT or empty resource path
+  resolves to the §8.5 default view `index.html` (a bare-store or trailing-slash URN
+  is NOT rejected — it names the store's landing page).
 - `?salt=<hex>` — OPTIONAL out-of-band private-store secret salt.
 
 Parsing MUST reuse the canonical `digstore-core` URN parser for the
@@ -78,17 +79,23 @@ names (e.g. a browser) MUST treat a non-literal, non-`localhost` name as NON-loo
 
 ### 5.1 Node path (`EndpointKind::Node`) — loopback only
 
-`GET {base}/s/<store_id>[:<root>]/<resource_key>`.
+`GET {base}/s/<store_id>[:<root>]/<resource_key>`. A loopback node may answer with
+verified PLAINTEXT or with CIPHERTEXT; the shape is detected DETERMINISTICALLY by
+headers (never assumed):
 
-- `2xx` AND the response carries `X-Dig-Verified: true` → the body is the decrypted,
-  node-verified plaintext (loopback trust). The content type is the response
-  `Content-Type` header, else derived (§7).
-- `2xx` WITHOUT `X-Dig-Verified: true` → the node did not attest verification → hard
-  `VerifyFailed` (fail-closed; §6 `IntegrityFailure`). The bytes are never returned.
+- **Verified plaintext** — `2xx` AND `X-Dig-Verified: true` → the body is the
+  node-decrypted, node-verified plaintext (loopback trust). Content type: the
+  response `Content-Type`, else derived (§7). No client-side crypto.
+- **Ciphertext** — `2xx` AND (`X-Dig-Encrypted: true` OR an `X-Dig-Inclusion-Proof`
+  header) → the body is opaque ciphertext that MUST be client-side verified+decrypted
+  exactly like the rpc path (§5.2 step 4), reusing `digstore-core` and threading the
+  URN salt. The trust root is the URN's pinned root, else the (loopback) node's
+  `X-Dig-Root`; the proof is `X-Dig-Inclusion-Proof`; `X-Dig-Chunk-Lens` (comma-
+  separated) gives the chunk layout. A node returning ciphertext is NOT trusted blindly.
+- `2xx` that is neither attested plaintext nor decryptable ciphertext → hard
+  `VerifyFailed` (fail-closed; §6 `IntegrityFailure`). Bytes are never returned.
 - `404` → hard `NotFound`.
-- other non-2xx / transport failure → treated as a transport failure (ladder falls
-  through). No client-side crypto is performed on this path (trust is the loopback
-  boundary + the attestation header).
+- other non-2xx / transport failure → a transport failure (ladder falls through).
 
 ### 5.2 RPC path (`EndpointKind::Rpc`) — the trust root comes from the URN
 
@@ -152,14 +159,16 @@ connect timeouts so dead ladder tiers fall through quickly.
 
 The front-door API is the branded `DigNetwork` class:
 
-- `new DigNetwork(endpoint?, connectUrl?)`.
+- `new DigNetwork(endpoint?, connectUrl?, cachePath?)` — `cachePath` is an optional
+  disk-cache directory (native; ignored in the browser, see §11).
 - `dig.resolve(urn) : Promise<{ outcome, bytes, contentType }>`, `outcome ∈
-  "success" | "integrity_failure" | "unreachable"`.
+  "success" | "integrity_failure" | "unreachable"`. `contentType` is present on
+  EVERY result.
 - `dig.resolveImageUrl(urn) : Promise<string>` — an `<img src>` URL that ALWAYS
   resolves (never throws for a normal failure): a `blob:` URL of the real verified
-  image on success, else a branded DIG error IMAGE as a `data:image/svg+xml;base64`
-  URI matching the failure (integrity / unreachable / not-found / invalid-URN /
-  generic). An `<img>` cannot render the HTML error docs, so these SVGs are the
+  image on success, else a branded DIG error IMAGE as a `data:image/png;base64` URI
+  matching the failure (integrity / unreachable / not-found / invalid-URN / generic).
+  An `<img>` cannot render the HTML error docs, so these prerendered PNGs are the
   image-path variant. FAIL-CLOSED: the integrity image is a STATIC branded
   placeholder — unverified bytes are NEVER returned as the image.
 
@@ -179,3 +188,27 @@ Low-level free functions `resolve(urn, endpoint?, connectUrl?)` and
   MUST NOT call `dig.getAnchoredRoot`.
 - Node-absent + a serving rpc gateway MUST resolve a valid ROOT-PINNED resource to
   `Success`.
+- A node CIPHERTEXT response MUST be client-side verified+decrypted (not trusted); a
+  salted URN MUST decrypt salted content on BOTH tiers, and a wrong/absent salt MUST
+  yield `IntegrityFailure`.
+- Caching (§11) MUST NOT weaken fail-closed: only `Success` is cached; a disk hit is
+  re-verified (a tampered file → `IntegrityFailure`).
+
+## 11. Caching
+
+Results are cached in front of resolve; this MUST NOT weaken fail-closed (§6).
+
+- **Cacheable:** ONLY a verified `Success`. `IntegrityFailure` / `Unreachable` /
+  `NotFound` / any `Err` MUST NOT be cached.
+- **Key:** the content-addressed identity `storeId:root:resourceKey:salt` with the
+  CONCRETE resolved root (a root-pinned URN's root, or the node's `X-Dig-Root`) —
+  never the raw request URN. A rootless URN with no concrete root is not cached.
+- **Memory tier (bounded LRU, both native + wasm):** process-trusted — holds only
+  what THIS process verified this run; a hit MAY skip re-verification. Bounded by an
+  entry count AND a byte budget (no unbounded growth in a wallet).
+- **Disk tier (optional, native, UNTRUSTED):** stores the VERIFIABLE artifacts
+  (ciphertext + inclusion proof + chunk lengths), NOT plaintext. A disk hit MUST be
+  RE-VERIFIED against the URN's root before use (same merkle/decrypt gate); a tampered
+  entry MUST fail verification → `IntegrityFailure` and MUST NOT be served. Filenames
+  MUST be `SHA-256(identity)` (content-addressed, no path-traversal). Ignored where
+  there is no filesystem (the browser); the memory tier still applies.

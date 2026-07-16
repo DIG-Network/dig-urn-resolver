@@ -55,19 +55,9 @@ impl ParsedUrn {
 
         let urn = Urn::parse(core_part).map_err(|e| ResolveError::Parse(format!("{e:?}")))?;
 
-        // A resource path is required to resolve a specific asset; a bare store
-        // URN (no `/path`) names no resource for a display resolve.
-        if urn
-            .resource_key
-            .as_deref()
-            .map(str::is_empty)
-            .unwrap_or(true)
-        {
-            return Err(ResolveError::Parse(
-                "URN has no resource path (expected …/<resource_key>)".into(),
-            ));
-        }
-
+        // An absent or empty resource path resolves to the §8.5 default view
+        // `index.html` (a bare store URL / a trailing slash → the store's landing
+        // page) — see [`Self::resource_key`]. It is NOT rejected.
         Ok(ParsedUrn { urn, salt })
     }
 

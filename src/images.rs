@@ -89,8 +89,31 @@ fn treatment(
     }
 }
 
-/// Render the branded, square SVG for a given error image (viewBox 512×512, scales
-/// down cleanly to a thumbnail).
+/// The PRERENDERED PNG bytes for an error image (512×512), embedded at build time.
+///
+/// These are rasterized ONCE at authoring from [`svg`] (via `resvg`, see
+/// `examples/render_error_images.rs`) and committed under `assets/` — there is NO
+/// runtime SVG-raster dependency, and a raster PNG renders deterministically in any
+/// `<img>` (some CSP policies block `data:image/svg+xml`). Each is a STATIC
+/// placeholder per failure kind, so it can never carry tampered/unverified content.
+pub fn png(kind: ErrorImage) -> &'static [u8] {
+    match kind {
+        ErrorImage::Integrity => include_bytes!("../assets/error-integrity.png"),
+        ErrorImage::Unreachable => include_bytes!("../assets/error-unreachable.png"),
+        ErrorImage::NotFound => include_bytes!("../assets/error-not-found.png"),
+        ErrorImage::InvalidUrn => include_bytes!("../assets/error-invalid-urn.png"),
+        ErrorImage::Generic => include_bytes!("../assets/error-generic.png"),
+    }
+}
+
+/// The branded image as a `data:image/png;base64,…` URI, ready for an `<img src>`.
+pub fn data_uri(kind: ErrorImage) -> String {
+    let b64 = base64::engine::general_purpose::STANDARD.encode(png(kind));
+    format!("data:image/png;base64,{b64}")
+}
+
+/// Render the branded, square SVG for a given error image (viewBox 512×512) — the
+/// DESIGN SOURCE the committed PNGs are rasterized from (see [`png`]).
 pub fn svg(kind: ErrorImage) -> String {
     let (accent, glow, glyph, title, subtitle) = treatment(kind);
     let subtitle_el = if subtitle.is_empty() {
@@ -110,23 +133,43 @@ pub fn svg(kind: ErrorImage) -> String {
   <text x='256' y='226' text-anchor='middle' font-family='{FONT}' font-size='84' font-weight='700' fill='{accent}'>{glyph}</text>
   <text x='256' y='320' text-anchor='middle' font-family='{FONT}' font-size='40' font-weight='700' fill='#ffffff'>{title}</text>
   {subtitle_el}
-  <text x='256' y='464' text-anchor='middle' font-family='{FONT}' font-size='22' font-weight='700' letter-spacing='6' fill='{accent}'>DIG NETWORK</text>
+  <text x='256' y='452' text-anchor='middle' font-family='{FONT}' font-size='22' font-weight='700' letter-spacing='6' fill='{accent}'>DIG NETWORK</text>
+  <text x='256' y='478' text-anchor='middle' font-family='{FONT}' font-size='16' letter-spacing='2' fill='#7f8db3'>dig.net</text>
 </svg>"##
     )
-}
-
-/// The branded image as a `data:image/svg+xml;base64,…` URI, ready for an `<img src>`.
-pub fn data_uri(kind: ErrorImage) -> String {
-    let b64 = base64::engine::general_purpose::STANDARD.encode(svg(kind).as_bytes());
-    format!("data:image/svg+xml;base64,{b64}")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
+
+    const PNG_MAGIC: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
 
     #[test]
-    fn every_kind_renders_a_labelled_branded_svg() {
+    fn every_kind_embeds_a_png_data_uri() {
+        for kind in [
+            ErrorImage::Integrity,
+            ErrorImage::Unreachable,
+            ErrorImage::NotFound,
+            ErrorImage::InvalidUrn,
+            ErrorImage::Generic,
+        ] {
+            // The embedded bytes are real PNGs (magic bytes).
+            assert!(png(kind).starts_with(PNG_MAGIC), "PNG magic present");
+            let uri = data_uri(kind);
+            assert!(uri.starts_with("data:image/png;base64,"));
+            // The decoded payload round-trips back to the PNG bytes.
+            let b64 = uri.trim_start_matches("data:image/png;base64,");
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .unwrap();
+            assert!(decoded.starts_with(PNG_MAGIC));
+        }
+    }
+
+    #[test]
+    fn svg_design_source_is_labelled_and_square() {
         for kind in [
             ErrorImage::Integrity,
             ErrorImage::Unreachable,
@@ -138,8 +181,6 @@ mod tests {
             assert!(svg.starts_with("<svg"));
             assert!(svg.contains("DIG NETWORK"), "wordmark present");
             assert!(svg.contains("viewBox='0 0 512 512'"), "square + scalable");
-            let uri = data_uri(kind);
-            assert!(uri.starts_with("data:image/svg+xml;base64,"));
         }
     }
 
@@ -184,12 +225,12 @@ mod tests {
 
     #[test]
     fn integrity_image_is_static_never_carries_bytes() {
-        // The integrity image is a constant placeholder — it can NEVER contain any
+        // The integrity image is a constant embedded PNG — it can NEVER contain any
         // (tampered) resource bytes, so no unverified byte reaches the <img>.
         let uri = data_uri(ErrorImage::Integrity);
-        let tampered = "TAMPERED_SECRET_PAYLOAD";
-        assert!(!uri.contains(tampered));
+        assert!(!uri.contains("TAMPERED_SECRET_PAYLOAD"));
         // Identical regardless of any surrounding context — it is a pure constant.
         assert_eq!(uri, data_uri(ErrorImage::Integrity));
+        assert_eq!(png(ErrorImage::Integrity), png(ErrorImage::Integrity));
     }
 }

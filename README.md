@@ -87,7 +87,7 @@ The front-door API is the branded, well-typed **`DigNetwork`** client:
 import init, { DigNetwork } from "@dignetwork/dig-urn-resolver";
 await init();
 
-const dig = new DigNetwork();               // or: new DigNetwork(endpoint, connectUrl)
+const dig = new DigNetwork();        // or: new DigNetwork(endpoint, connectUrl, cachePath)
 
 // The NFT-image case — a URL for <img src>, working with no dig-node running:
 img.src = await dig.resolveImageUrl(nftDataUri);
@@ -99,18 +99,47 @@ const { outcome, bytes, contentType } = await dig.resolve(nftDataUri);
 
 `resolveImageUrl` ALWAYS returns a usable `<img>` URL and never throws for a normal
 failure: the real verified image on success, else a **branded DIG error image**
-(embedded SVG `data:` URI) matching the failure — integrity failure, network
+(embedded PNG `data:` URI) matching the failure — integrity failure, network
 unreachable, not found, invalid URN, or a generic error. On an integrity failure it
 is the STATIC branded placeholder — **never** the unverified bytes as the image. (The
 HTML error pages via `resolve().render()` stay for the webview/navigation case.)
 Low-level free functions (`resolve`, `resolveObjectUrl`) remain available.
+
+## Caching
+
+URNs are content-addressed → immutable → cacheable, so results are cached as an
+additive layer in front of resolve that never weakens fail-closed:
+
+- **Only VERIFIED `Success` bytes are cached** — never an integrity/unreachable/
+  not-found failure (a cached failure would block recovery).
+- **Keyed by the content-addressed identity** `storeId:root:resourceKey:salt` with
+  the CONCRETE resolved root — a root-pinned URN is immutable; a rootless URN is
+  cached under the root the resolve produced (`X-Dig-Root`), never a stale
+  URN→bytes mapping.
+- **Memory (default, bounded LRU):** process-trusted (only holds what this process
+  verified this run) — a hit skips re-verification.
+- **Disk (optional `cachePath`, native):** UNTRUSTED — it stores the *verifiable
+  artifacts* (ciphertext + proof + chunk lengths), and a disk hit is **re-verified**
+  against the URN's root before use, so a tampered on-disk file FAILS verification →
+  `IntegrityFailure` (never served). Filenames are `SHA-256(identity)` (no
+  path-traversal). Ignored in the browser (no filesystem); the memory cache still
+  applies.
+
+## Content type & the default view
+
+`contentType` is present on every `resolve` result: the store's stored
+`Content-Type` on the node path, else inferred from the URN path extension / magic
+bytes. A bare-store or trailing-slash URN resolves to the §8.5 default view
+`index.html`.
 
 ### CORS note for consuming apps (Sage/Tauri)
 
 The `/health` + `/s/` probes hit `dig.local`/`localhost` from the app origin and may
 be CORS-blocked in a desktop webview; the `rpc.dig.net` fallback (`Access-Control-
 Allow-Origin: *`) always works, so a resolve succeeds node-absent. Add the endpoints
-to the app's `connect-src` CSP.
+to the app's `connect-src` CSP. For the browser node path to read the verification
+attestation, the node must send `Access-Control-Expose-Headers: X-Dig-Verified`
+(a missing header fails closed) — see #669.
 
 ## Example
 

@@ -9,9 +9,10 @@
 //!
 //! * **node tier** (`GET /s/<storeId>[:<root>]/<path>`) — a local dig-node decrypts
 //!   + verifies server-side under a loopback trust boundary and returns plaintext.
-//! * **rpc tier** (`dig.getAnchoredRoot` + `dig.getContent`) — a blind fetch of
-//!   opaque ciphertext + inclusion proofs from the public gateway, VERIFIED against
-//!   the chain-anchored root and decrypted client-side (fail-closed).
+//! * **rpc tier** (`dig.getContent`) — a blind fetch of opaque ciphertext +
+//!   inclusion proofs from the untrusted public gateway, VERIFIED against the
+//!   URN's PINNED root and decrypted client-side (fail-closed). The trust root is
+//!   NEVER taken from the gateway; a rootless URN is rejected on this tier.
 //!
 //! ## Reuse, not reimplementation
 //! All read-crypto (URN canonicalization + retrieval-key derivation, merkle
@@ -39,6 +40,7 @@
 //! `resolveObjectUrl(urn)` (wasm) → an object URL usable as an `<img src>`, working
 //! with no dig-node running (rpc fallback) and faster when a node is present.
 
+pub mod cache;
 pub mod content_type;
 pub mod crypto;
 pub mod error;

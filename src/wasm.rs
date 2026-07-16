@@ -85,6 +85,13 @@ impl FetchTransport {
         if let Ok(Some(ct)) = resp.headers().get("content-type") {
             headers.push(("content-type".to_string(), ct));
         }
+        // Capture the node's verification attestation so the loopback node path is
+        // NOT dead in the browser. The node MUST send
+        // `Access-Control-Expose-Headers: X-Dig-Verified` for this to be readable
+        // cross-origin (see the CORS note in the module docs / #669).
+        if let Ok(Some(v)) = resp.headers().get("x-dig-verified") {
+            headers.push(("x-dig-verified".to_string(), v));
+        }
 
         let buf = JsFuture::from(resp.array_buffer().map_err(js_err)?)
             .await
@@ -123,23 +130,27 @@ fn opt(s: Option<String>) -> Option<String> {
     s.filter(|v| !v.trim().is_empty())
 }
 
-fn options(endpoint: Option<String>, connect_url: Option<String>) -> ResolveOptions {
+fn options(
+    endpoint: Option<String>,
+    connect_url: Option<String>,
+    cache_path: Option<String>,
+) -> ResolveOptions {
     ResolveOptions {
         endpoint: opt(endpoint),
         connect_url: opt(connect_url),
+        cache_path: opt(cache_path),
     }
-}
-
-fn resolver(endpoint: Option<String>, connect_url: Option<String>) -> Resolver<FetchTransport> {
-    Resolver::with_options(FetchTransport, options(endpoint, connect_url))
 }
 
 async fn do_resolve(
     urn: String,
     endpoint: Option<String>,
     connect_url: Option<String>,
+    cache_path: Option<String>,
 ) -> Result<ResolveOutcome, ResolveError> {
-    resolver(endpoint, connect_url).resolve(&urn).await
+    Resolver::with_options(FetchTransport, options(endpoint, connect_url, cache_path))
+        .resolve(&urn)
+        .await
 }
 
 /// The effective connect-CTA URL for the unreachable page (default if unset).
@@ -202,32 +213,42 @@ fn outcome_to_result(outcome: &ResolveOutcome, connect_url: &str) -> ResolveResu
 /// ```js
 /// import init, { DigNetwork } from "@dignetwork/dig-urn-resolver";
 /// await init();
-/// const dig = new DigNetwork();                 // or new DigNetwork(endpoint, connectUrl)
+/// const dig = new DigNetwork();                 // or new DigNetwork(endpoint, connectUrl, cachePath)
 /// img.src = await dig.resolveImageUrl(nftUrn);  // <img src> — works node-absent (rpc)
 /// const { outcome, bytes, contentType } = await dig.resolve(urn);
 /// ```
 ///
-/// Construct once and reuse — the ladder plan is cached per instance.
+/// Construct once and reuse — the ladder plan AND verified results are cached per
+/// instance (content-addressed; only verified Success is cached).
 #[wasm_bindgen]
 #[derive(Clone)]
 pub struct DigNetwork {
     endpoint: Option<String>,
     connect_url: Option<String>,
+    cache_path: Option<String>,
 }
 
 #[wasm_bindgen]
 impl DigNetwork {
-    /// `new DigNetwork(endpoint?, connectUrl?)`.
+    /// `new DigNetwork(endpoint?, connectUrl?, cachePath?)`.
     ///
     /// * `endpoint` — an explicit node/gateway override (§5.3): it WINS over the
     ///   auto-ladder. A loopback host may use the node path; any other host is used
     ///   as a client-verified rpc endpoint.
     /// * `connectUrl` — the "Connect to Node" target on the unreachable page.
+    /// * `cachePath` — a DISK cache directory (persisted, re-verified on read).
+    ///   Absent ⇒ the in-memory LRU only. IGNORED in the browser (no filesystem) —
+    ///   the in-memory cache still applies.
     #[wasm_bindgen(constructor)]
-    pub fn new(endpoint: Option<String>, connect_url: Option<String>) -> DigNetwork {
+    pub fn new(
+        endpoint: Option<String>,
+        connect_url: Option<String>,
+        cache_path: Option<String>,
+    ) -> DigNetwork {
         DigNetwork {
             endpoint: opt(endpoint),
             connect_url: opt(connect_url),
+            cache_path: opt(cache_path),
         }
     }
 
@@ -237,10 +258,15 @@ impl DigNetwork {
     /// page, never unverified content. Rejects only on a hard error (bad URN,
     /// not-found, reachable rpc protocol error, or a rootless URN over the gateway).
     pub async fn resolve(&self, urn: String) -> Result<ResolveResult, JsError> {
-        let (endpoint, connect) = (self.endpoint.clone(), self.connect_url.clone());
-        let outcome = do_resolve(urn, endpoint, connect.clone())
-            .await
-            .map_err(|e| JsError::new(&e.to_string()))?;
+        let connect = self.connect_url.clone();
+        let outcome = do_resolve(
+            urn,
+            self.endpoint.clone(),
+            connect.clone(),
+            self.cache_path.clone(),
+        )
+        .await
+        .map_err(|e| JsError::new(&e.to_string()))?;
         Ok(outcome_to_result(&outcome, &connect_or_default(connect)))
     }
 
@@ -258,8 +284,14 @@ impl DigNetwork {
     /// image — the tampered/unverified bytes are NEVER rendered as the image.
     #[wasm_bindgen(js_name = resolveImageUrl)]
     pub async fn resolve_image_url(&self, urn: String) -> Result<String, JsError> {
-        let (endpoint, connect) = (self.endpoint.clone(), self.connect_url.clone());
-        match do_resolve(urn, endpoint, connect).await {
+        match do_resolve(
+            urn,
+            self.endpoint.clone(),
+            self.connect_url.clone(),
+            self.cache_path.clone(),
+        )
+        .await
+        {
             // The real, verified image bytes as a blob URL.
             Ok(ResolveOutcome::Success(data)) => object_url(&data.bytes, &data.content_type)
                 .map_err(|e| JsError::new(&e.to_string())),
@@ -282,7 +314,9 @@ pub async fn resolve(
     endpoint: Option<String>,
     connect_url: Option<String>,
 ) -> Result<ResolveResult, JsError> {
-    DigNetwork::new(endpoint, connect_url).resolve(urn).await
+    DigNetwork::new(endpoint, connect_url, None)
+        .resolve(urn)
+        .await
 }
 
 /// Low-level: resolve to an `<img src>` URL (real blob on success, a branded error
@@ -293,7 +327,7 @@ pub async fn resolve_object_url(
     endpoint: Option<String>,
     connect_url: Option<String>,
 ) -> Result<String, JsError> {
-    DigNetwork::new(endpoint, connect_url)
+    DigNetwork::new(endpoint, connect_url, None)
         .resolve_image_url(urn)
         .await
 }

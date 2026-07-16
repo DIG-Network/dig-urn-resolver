@@ -19,13 +19,33 @@
 //! A malformed URN, a not-found resource, and a reachable rpc PROTOCOL error remain
 //! hard [`ResolveError`]s.
 
+use crate::cache::{self, DiskArtifacts, MemoryCache};
 use crate::error::{ResolveError, Result};
 use crate::ladder::{self, Endpoint, EndpointKind};
 use crate::pages;
 use crate::transport::HttpTransport;
 use crate::urn::ParsedUrn;
 use crate::{node, rpc};
+// Used only by the native disk-cache re-verify path.
+#[cfg(feature = "native")]
+use crate::{content_type, crypto};
 use std::cell::RefCell;
+
+/// The internal result of one endpoint fetch: the resolved data plus, when known,
+/// the CONCRETE content root (for the cache identity) and the verifiable artifacts
+/// (rpc path only) that let the disk cache re-verify a hit.
+pub(crate) struct Fetched {
+    /// The verified, decrypted resource.
+    pub data: ResolvedData,
+    /// The concrete resolved root (pinned root on the rpc path, `X-Dig-Root` on the
+    /// node path) — `None` when the tier did not expose it (then it is not cached).
+    pub root: Option<String>,
+    /// The verifiable rpc artifacts (ciphertext + proof + chunk lens) for the disk
+    /// cache; `None` when the bytes are not re-verifiable. Consumed by the native
+    /// disk cache; unused on wasm (no filesystem).
+    #[cfg_attr(not(feature = "native"), allow(dead_code))]
+    pub artifacts: Option<DiskArtifacts>,
+}
 
 /// The resolved bytes plus their content type. Only ever the VERIFIED content of a
 /// [`ResolveOutcome::Success`], or the branded HTML of a rendered non-success
@@ -108,18 +128,25 @@ impl ResolveOutcome {
 #[derive(Debug, Clone, Default)]
 pub struct ResolveOptions {
     /// An explicit endpoint override. When set it WINS and skips the ladder (§5.3):
-    /// a node iff its `/health` answers, else an rpc endpoint.
+    /// a loopback host may use the node path; any other host is a verified rpc endpoint.
     pub endpoint: Option<String>,
     /// Override the "Connect to Node" CTA target on the unreachable page. Defaults
     /// to [`pages::DEFAULT_CONNECT_URL`].
     pub connect_url: Option<String>,
+    /// Optional DISK cache directory (native only). When set, verified rpc results
+    /// are persisted (as re-verifiable artifacts) and re-verified on read; absent ⇒
+    /// the in-memory cache only. Ignored on wasm (no filesystem).
+    pub cache_path: Option<String>,
 }
 
-/// A URN resolver over an injected [`HttpTransport`]. The resolved ladder plan is
-/// cached per instance (one `/health` probe sweep, then reused).
+/// A URN resolver over an injected [`HttpTransport`]. The ladder plan and verified
+/// results are cached per instance.
 pub struct Resolver<T: HttpTransport + ?Sized> {
     options: ResolveOptions,
     plan_cache: RefCell<Option<Vec<Endpoint>>>,
+    memory: MemoryCache,
+    #[cfg(feature = "native")]
+    disk: Option<cache::DiskCache>,
     transport: T,
 }
 
@@ -131,9 +158,14 @@ impl<T: HttpTransport> Resolver<T> {
 
     /// Build a resolver with explicit options.
     pub fn with_options(transport: T, options: ResolveOptions) -> Self {
+        #[cfg(feature = "native")]
+        let disk = options.cache_path.as_ref().map(cache::DiskCache::new);
         Resolver {
-            options,
             plan_cache: RefCell::new(None),
+            memory: MemoryCache::new(cache::DEFAULT_MEMORY_ENTRIES, cache::DEFAULT_MEMORY_BYTES),
+            #[cfg(feature = "native")]
+            disk,
+            options,
             transport,
         }
     }
@@ -159,29 +191,115 @@ impl<T: HttpTransport + ?Sized> Resolver<T> {
     }
 
     /// Fetch a resource from one endpoint.
-    async fn fetch_from(&self, endpoint: &Endpoint, parsed: &ParsedUrn) -> Result<ResolvedData> {
+    async fn fetch_from(&self, endpoint: &Endpoint, parsed: &ParsedUrn) -> Result<Fetched> {
         match endpoint.kind {
             EndpointKind::Node => node::fetch(&self.transport, &endpoint.base, parsed).await,
             EndpointKind::Rpc => rpc::fetch(&self.transport, &endpoint.base, parsed).await,
         }
     }
 
+    /// The content-addressed cache identity for a resource at a CONCRETE root.
+    fn cache_id(parsed: &ParsedUrn, root: &str) -> String {
+        cache::content_id(
+            &parsed.store_id_hex(),
+            root,
+            parsed.resource_key(),
+            parsed.salt.as_deref(),
+        )
+    }
+
+    /// A disk-cache hit, RE-VERIFIED against the URN's pinned root before use. `None`
+    /// on miss (or a malformed entry). A tampered entry FAILS re-verification →
+    /// `Some(IntegrityFailure)` and the bad file is dropped — never serves bad bytes.
+    #[cfg(feature = "native")]
+    fn disk_get_verified(&self, parsed: &ParsedUrn, id: &str) -> Option<ResolveOutcome> {
+        let disk = self.disk.as_ref()?;
+        let root = parsed.root_hex()?; // disk cache is rpc/root-pinned only
+        let art = disk.get(id)?;
+        match crypto::verify_and_decrypt(
+            parsed,
+            &art.ciphertext,
+            &art.proof_b64,
+            &root,
+            &art.chunk_lens,
+        ) {
+            Ok(bytes) => {
+                let ct = content_type::derive(parsed.resource_key(), &bytes);
+                Some(ResolveOutcome::Success(ResolvedData::new(bytes, ct)))
+            }
+            // Tampered on-disk artifacts → fail closed; drop the poisoned entry.
+            Err(ResolveError::VerifyFailed(_)) | Err(ResolveError::DecryptFailed) => {
+                disk.remove(id);
+                Some(ResolveOutcome::IntegrityFailure)
+            }
+            // Malformed → treat as a miss and drop it.
+            Err(_) => {
+                disk.remove(id);
+                None
+            }
+        }
+    }
+
+    #[cfg(not(feature = "native"))]
+    fn disk_get_verified(&self, _parsed: &ParsedUrn, _id: &str) -> Option<ResolveOutcome> {
+        None
+    }
+
+    /// Cache a verified `Success` — memory always; disk when the fetch produced
+    /// re-verifiable artifacts (rpc path) and a disk cache is configured.
+    fn cache_success(&self, parsed: &ParsedUrn, fetched: &Fetched) {
+        let Some(root) = fetched.root.as_deref() else {
+            return; // no concrete root ⇒ not content-addressable ⇒ do not cache
+        };
+        let id = Self::cache_id(parsed, root);
+        self.memory.put(id.clone(), fetched.data.clone());
+        #[cfg(feature = "native")]
+        if let (Some(disk), Some(art)) = (self.disk.as_ref(), fetched.artifacts.as_ref()) {
+            disk.put(&id, art);
+        }
+        let _ = &id;
+    }
+
     /// Resolve a DIG URN to a typed [`ResolveOutcome`].
     ///
-    /// Walks the ladder plan in order. A tier's TRANSPORT failure falls through to
-    /// the next tier; when the LAST tier is transport-unreachable the whole network
-    /// is down → [`ResolveOutcome::Unreachable`]. A verify/decrypt failure at any
-    /// tier is [`ResolveOutcome::IntegrityFailure`] IMMEDIATELY (fail-closed, never
-    /// cascaded, never the friendly page). A malformed URN / not-found / rpc
-    /// protocol error is a hard `Err`.
+    /// A cache layer sits IN FRONT of the network resolve but never weakens
+    /// fail-closed: a memory hit is process-trusted (only holds what this process
+    /// already verified); a disk hit is RE-VERIFIED against the URN's root (a
+    /// tampered file → `IntegrityFailure`). Only verified `Success` bytes are cached.
+    ///
+    /// On a miss it walks the ladder plan: a tier's TRANSPORT failure falls through;
+    /// the LAST tier transport-unreachable → [`ResolveOutcome::Unreachable`]; a
+    /// verify/decrypt failure at any tier → [`ResolveOutcome::IntegrityFailure`]
+    /// IMMEDIATELY (never cascaded/masked); a malformed URN / not-found / rpc
+    /// protocol error → a hard `Err`.
     pub async fn resolve(&self, urn: &str) -> Result<ResolveOutcome> {
         let parsed = ParsedUrn::parse(urn)?;
+
+        // Cache lookup ONLY when the content identity is known up-front (a pinned
+        // root). A rootless URN's concrete root is only known after resolving, so it
+        // is cached post-resolve (never a rootless→bytes mapping that could go stale).
+        let pinned_id = parsed.root_hex().map(|root| Self::cache_id(&parsed, &root));
+        if let Some(id) = &pinned_id {
+            if let Some(data) = self.memory.get(id) {
+                return Ok(ResolveOutcome::Success(data)); // process-trusted hit
+            }
+            if let Some(outcome) = self.disk_get_verified(&parsed, id) {
+                if let ResolveOutcome::Success(data) = &outcome {
+                    self.memory.put(id.clone(), data.clone());
+                }
+                return Ok(outcome);
+            }
+        }
+
         let plan = self.plan().await;
         let last = plan.len().saturating_sub(1);
 
         for (i, endpoint) in plan.iter().enumerate() {
             match self.fetch_from(endpoint, &parsed).await {
-                Ok(data) => return Ok(ResolveOutcome::Success(data)),
+                Ok(fetched) => {
+                    self.cache_success(&parsed, &fetched); // only verified Success is cached
+                    return Ok(ResolveOutcome::Success(fetched.data));
+                }
                 // Reached the endpoint, bytes failed integrity → hard security
                 // fail-closed. Distinct from unreachable; never cascade or mask.
                 Err(ResolveError::VerifyFailed(_)) | Err(ResolveError::DecryptFailed) => {
