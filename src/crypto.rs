@@ -82,24 +82,35 @@ pub fn decrypt(parsed: &ParsedUrn, ciphertext: &[u8], chunk_lens: &[u32]) -> Res
     let canonical = parsed.canonical_rootless().canonical();
     let aes_key = derive_decryption_key(&canonical, salt.map(SecretSalt).as_ref());
 
-    let plan: Vec<usize> = if chunk_lens.is_empty() {
-        vec![ciphertext.len()]
+    // `chunk_lens` is gateway/node-supplied and is NOT covered by the merkle proof, so
+    // it is UNTRUSTED. Accumulate + bound in u64 and slice against the REMAINING buffer
+    // so a crafted length (e.g. `[len+2^31, 2^31]`) can never wrap `usize` on wasm32 and
+    // slice out of bounds → `panic=abort` (wallet crash). Any inconsistency fails closed
+    // as `DecryptFailed` (→ IntegrityFailure), never a panic.
+    let ct_len = ciphertext.len() as u64;
+    let plan: Vec<u64> = if chunk_lens.is_empty() {
+        vec![ct_len]
     } else {
-        chunk_lens.iter().map(|&l| l as usize).collect()
+        chunk_lens.iter().map(|&l| l as u64).collect()
     };
-    let total: usize = plan.iter().sum();
-    if total != ciphertext.len() {
-        return Err(ResolveError::Rpc(format!(
-            "served ciphertext length {} does not match chunk total {total}",
-            ciphertext.len(),
-        )));
+    let mut total: u64 = 0;
+    for &len in &plan {
+        total = total.checked_add(len).ok_or(ResolveError::DecryptFailed)?;
+    }
+    if total != ct_len {
+        return Err(ResolveError::DecryptFailed);
     }
 
     let mut plaintext = Vec::with_capacity(ciphertext.len());
-    let mut p = 0usize;
+    let mut p: usize = 0;
     for len in plan {
-        let ct = &ciphertext[p..p + len];
-        p += len;
+        // `total == ct_len` already bounds each `len`, but slice defensively anyway:
+        // reject any window that would exceed the remaining buffer.
+        let len = usize::try_from(len).map_err(|_| ResolveError::DecryptFailed)?;
+        let end = p.checked_add(len).filter(|&e| e <= ciphertext.len());
+        let end = end.ok_or(ResolveError::DecryptFailed)?;
+        let ct = &ciphertext[p..end];
+        p = end;
         let pt = decrypt_chunk(&aes_key, ct).map_err(|_| ResolveError::DecryptFailed)?;
         plaintext.extend_from_slice(&pt);
     }
@@ -116,4 +127,34 @@ pub fn verify_and_decrypt(
 ) -> Result<Vec<u8>> {
     verify_inclusion(ciphertext, proof_b64, trusted_root_hex)?;
     decrypt(parsed, ciphertext, chunk_lens)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn urn() -> ParsedUrn {
+        ParsedUrn::parse(&format!("urn:dig:chia:{}/a.bin", "ab".repeat(32))).unwrap()
+    }
+
+    #[test]
+    fn decrypt_rejects_overflowing_chunk_lens_without_panic() {
+        // `[len+2^31, 2^31]` wraps usize on wasm32; the u64-checked total must reject
+        // it cleanly (fail-closed), never slice out of bounds / panic.
+        let ct = vec![0u8; 10];
+        let bad = [(1u32 << 31) + 10, 1u32 << 31];
+        assert!(matches!(
+            decrypt(&urn(), &ct, &bad),
+            Err(ResolveError::DecryptFailed)
+        ));
+    }
+
+    #[test]
+    fn decrypt_rejects_chunk_total_mismatch() {
+        let ct = vec![0u8; 10];
+        assert!(matches!(
+            decrypt(&urn(), &ct, &[999]),
+            Err(ResolveError::DecryptFailed)
+        ));
+    }
 }

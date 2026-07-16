@@ -18,7 +18,7 @@ crate-type = ["cdylib", "rlib"]
 # `native` — the default: a `reqwest` HTTP transport + a blocking convenience.
 # `wasm`   — the wasm-bindgen surface + a browser-`fetch` transport (built by wasm-pack).
 default = ["native"]
-native = ["dep:reqwest", "dep:tokio"]
+native = ["dep:reqwest", "dep:tokio", "dep:url"]
 wasm = [
   "dep:wasm-bindgen",
   "dep:wasm-bindgen-futures",
@@ -44,6 +44,9 @@ thiserror = "2"
 # native transport (feature `native`)
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"], optional = true }
 tokio = { version = "1", features = ["rt", "macros"], optional = true }
+# WHATWG URL parser — the SAME crate reqwest dials with, so the ladder's host
+# classification is byte-identical to the real connect target (no hand-rolled splitter).
+url = { version = "2", optional = true }
 
 # wasm transport + bindings (feature `wasm`)
 wasm-bindgen = { version = "0.2", optional = true }

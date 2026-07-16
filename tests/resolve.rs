@@ -676,6 +676,23 @@ async fn tampered_disk_cache_entry_fails_closed() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[tokio::test]
+async fn chunk_lens_overflow_is_integrity_failure_not_panic() {
+    // The gateway serves VERIFIED ciphertext but crafts chunk_lens whose total wraps
+    // usize on wasm32 (`[len+2^31, 2^31]`) to slice out of bounds → panic=abort. The
+    // u64-checked total + bounded slicing must fail closed to IntegrityFailure, never
+    // panic (integrity already holds — this is the availability guard).
+    let mut fx = build_fixture(IMG_KEY, b"authentic bytes here!!", None);
+    let root = fx.root_hex.clone();
+    let real = fx.total_length as u32;
+    fx.chunk_lens = vec![real.wrapping_add(1 << 31), 1 << 31];
+    let outcome = Resolver::new(rpc_serving(fx))
+        .resolve(&root_pinned_urn(IMG_KEY, &root))
+        .await
+        .unwrap();
+    assert_eq!(outcome, ResolveOutcome::IntegrityFailure);
+}
+
 // --- Node vs browser env degradation ---------------------------------------
 
 #[tokio::test]

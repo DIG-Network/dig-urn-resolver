@@ -69,31 +69,46 @@ impl Endpoint {
     }
 }
 
-/// Extract the host (no scheme, path, or port) from a base URL. Handles the
-/// `[ipv6]:port` bracket form and `host:port`.
+/// Parse the HOST of a base URL with the SAME WHATWG URL parser the transport dials
+/// with, so the classifier's host is byte-identical to the real connect target. This
+/// is the security-critical fix for URL confusion: a hand-rolled splitter diverges
+/// from WHATWG on userinfo (`@`), backslash (`\`→`/` for special schemes), fragment
+/// (`#`), query (`?`) and percent-encoding — each of which could let a loopback-looking
+/// authority mask a REMOTE dial target and steal crypto-free node trust.
 ///
-/// SECURITY: any `user:pass@` userinfo is stripped FIRST, so the returned host is the
-/// real connect target — the part AFTER the last `@` — exactly what `reqwest`/the url
-/// crate dial. Without this, `http://127.0.0.1:9778@evil.com/` would parse a loopback
-/// "host" while the transport connects to `evil.com`, re-opening the crypto-free node
-/// trust bypass (a URL-confusion integrity bypass).
-pub fn host_of(base: &str) -> &str {
-    let after_scheme = base.split("://").nth(1).unwrap_or(base);
-    let authority = after_scheme.split('/').next().unwrap_or(after_scheme);
-    // Drop userinfo: the true host is after the LAST '@' ('@' inside userinfo must be
-    // percent-encoded, so the last '@' delimits userinfo from host).
-    let authority = match authority.rsplit_once('@') {
-        Some((_userinfo, host)) => host,
-        None => authority,
-    };
-    if let Some(rest) = authority.strip_prefix('[') {
-        // `[ipv6]:port` → the bracketed address.
-        return rest.split(']').next().unwrap_or(rest);
+/// Returns `None` for a URL that does not parse or is not http(s) — such a base is
+/// NEVER granted node trust. Native uses the `url` crate (reqwest's parser); wasm uses
+/// the browser's WHATWG `URL` (what `fetch` uses).
+fn parsed_host(base: &str) -> Option<String> {
+    #[cfg(feature = "native")]
+    {
+        let url = url::Url::parse(base).ok()?;
+        match url.scheme() {
+            "http" | "https" => url.host_str().map(|h| h.to_string()),
+            _ => None,
+        }
     }
-    match authority.rfind(':') {
-        Some(i) => &authority[..i],
-        None => authority,
+    #[cfg(all(not(feature = "native"), feature = "wasm"))]
+    {
+        let url = web_sys::Url::new(base).ok()?;
+        match url.protocol().as_str() {
+            "http:" | "https:" => Some(url.hostname()),
+            _ => None,
+        }
     }
+    #[cfg(all(not(feature = "native"), not(feature = "wasm")))]
+    {
+        let _ = base;
+        None
+    }
+}
+
+/// Whether the base URL's PARSED host is an asserted-loopback host (→ node trust).
+/// `false` for a URL that does not parse / is not http(s) / is not loopback.
+fn is_loopback_base(base: &str) -> bool {
+    parsed_host(base)
+        .map(|h| is_loopback_host(&h))
+        .unwrap_or(false)
 }
 
 /// Whether `host` resolves (via the OS resolver / hosts file) to loopback addresses
@@ -141,11 +156,11 @@ pub fn is_loopback_host(host: &str) -> bool {
 /// Classify a base URL into a trust-correct [`Endpoint`]: node ONLY for an
 /// asserted-loopback host, rpc (client-verified) for everything else.
 pub fn classify(base: &str) -> Endpoint {
-    let base = base.trim_end_matches('/').to_string();
-    if is_loopback_host(host_of(&base)) {
-        Endpoint::node(base)
+    let trimmed = base.trim_end_matches('/').to_string();
+    if is_loopback_base(&trimmed) {
+        Endpoint::node(trimmed)
     } else {
-        Endpoint::rpc(base)
+        Endpoint::rpc(trimmed)
     }
 }
 
@@ -178,7 +193,7 @@ pub async fn build_plan<T: HttpTransport + ?Sized>(
 
     for tier in [DIG_LOCAL_BASE, LOCALHOST_BASE] {
         // Node trust requires BOTH loopback assertion AND a live /health.
-        if is_loopback_host(host_of(tier)) && health_ok(transport, tier).await {
+        if is_loopback_base(tier) && health_ok(transport, tier).await {
             return vec![Endpoint::node(tier), Endpoint::rpc(RPC_DEFAULT_BASE)];
         }
     }
@@ -190,41 +205,67 @@ mod tests {
     use super::*;
 
     #[test]
-    fn host_parsing() {
-        assert_eq!(host_of("http://dig.local:9778"), "dig.local");
-        assert_eq!(host_of("http://localhost:9778"), "localhost");
-        assert_eq!(host_of("http://127.0.0.1:9778"), "127.0.0.1");
-        assert_eq!(host_of("http://[::1]:9778"), "::1");
-        assert_eq!(host_of("https://rpc.dig.net"), "rpc.dig.net");
-        assert_eq!(host_of("http://evil.example.com/path"), "evil.example.com");
+    fn parsed_host_matches_the_whatwg_dial_target() {
+        assert_eq!(
+            parsed_host("http://dig.local:9778").as_deref(),
+            Some("dig.local")
+        );
+        assert_eq!(
+            parsed_host("http://localhost:9778").as_deref(),
+            Some("localhost")
+        );
+        assert_eq!(
+            parsed_host("http://127.0.0.1:9778").as_deref(),
+            Some("127.0.0.1")
+        );
+        assert_eq!(parsed_host("http://[::1]:9778").as_deref(), Some("[::1]"));
+        assert_eq!(
+            parsed_host("https://rpc.dig.net").as_deref(),
+            Some("rpc.dig.net")
+        );
+        assert_eq!(
+            parsed_host("http://evil.example.com/path").as_deref(),
+            Some("evil.example.com")
+        );
+        // Non-http(s) or unparseable → no host → never node-trusted.
+        assert_eq!(parsed_host("ftp://localhost").as_deref(), None);
+        assert_eq!(parsed_host("not a url").as_deref(), None);
     }
 
     #[test]
-    fn host_of_strips_userinfo_to_the_real_connect_target() {
-        // The transport connects to the host AFTER the last '@'; the classifier must
-        // see the SAME host, never the loopback-looking userinfo.
-        assert_eq!(host_of("http://127.0.0.1:9778@evil.com/"), "evil.com");
-        assert_eq!(host_of("http://localhost:9778@evil.com"), "evil.com");
-        assert_eq!(host_of("http://[::1]@evil.com"), "evil.com");
-        assert_eq!(host_of("http://user:pass@evil.com:1234/x"), "evil.com");
+    fn url_confusion_urls_are_never_node_trusted() {
+        // F1 (complete): userinfo (@), backslash (\ → / for special schemes), fragment
+        // (#), query (?), and percent-encoding MUST NOT mask a remote dial target as a
+        // loopback "host". The classifier parses with the transport's parser, so its
+        // host equals the real connect target — all of these → verified Rpc, not Node.
+        for base in [
+            "http://127.0.0.1:9778@evil.com",
+            "http://localhost:9778@evil.com",
+            "http://[::1]@evil.com",
+            "http://user:pass@evil.com:1234/x",
+            r"http://evil.com\@localhost",
+            r"http://evil.com\@127.0.0.1",
+            "http://evil.com#@localhost",
+            "http://evil.com?x=@localhost",
+            "http://127.0.0.1%40evil.com",
+        ] {
+            assert_eq!(
+                classify(base).kind,
+                EndpointKind::Rpc,
+                "URL-confusion base must classify Rpc (verified), not Node: {base}"
+            );
+        }
+    }
+
+    #[test]
+    fn genuine_loopback_still_node_trusted() {
         // Legitimate userinfo in front of a real loopback host still resolves to it.
-        assert_eq!(host_of("http://user:pass@127.0.0.1:9778"), "127.0.0.1");
-    }
-
-    #[test]
-    fn userinfo_confusion_urls_are_never_node_trusted() {
-        // F1 gate: a loopback-looking userinfo must NOT grant crypto-free node trust
-        // when the real connect target is remote.
         assert_eq!(
-            classify("http://127.0.0.1:9778@evil.com").kind,
-            EndpointKind::Rpc
+            classify("http://user:pass@127.0.0.1:9778").kind,
+            EndpointKind::Node
         );
-        assert_eq!(
-            classify("http://localhost:9778@evil.com").kind,
-            EndpointKind::Rpc
-        );
-        assert_eq!(classify("http://[::1]@evil.com").kind, EndpointKind::Rpc);
-        assert!(!is_loopback_host(host_of("http://127.0.0.1:9778@evil.com")));
+        assert_eq!(classify("http://localhost:9778").kind, EndpointKind::Node);
+        assert_eq!(classify("http://127.0.0.1").kind, EndpointKind::Node);
     }
 
     #[test]
