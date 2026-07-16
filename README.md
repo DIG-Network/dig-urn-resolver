@@ -89,17 +89,21 @@ await init();
 
 const dig = new DigNetwork();               // or: new DigNetwork(endpoint, connectUrl)
 
-// The NFT-image case — a blob: URL for <img src>, working with no dig-node running:
+// The NFT-image case — a URL for <img src>, working with no dig-node running:
 img.src = await dig.resolveImageUrl(nftDataUri);
 
-// Or the typed form:
+// Or the typed form (real outcome + MIME, not an image):
 const { outcome, bytes, contentType } = await dig.resolve(nftDataUri);
 // outcome ∈ "success" | "integrity_failure" | "unreachable"
 ```
 
-On an integrity failure, `resolveImageUrl` returns the branded security page —
-**never** the unverified bytes as an image. Low-level free functions (`resolve`,
-`resolveObjectUrl`) remain available for callers that prefer them.
+`resolveImageUrl` ALWAYS returns a usable `<img>` URL and never throws for a normal
+failure: the real verified image on success, else a **branded DIG error image**
+(embedded SVG `data:` URI) matching the failure — integrity failure, network
+unreachable, not found, invalid URN, or a generic error. On an integrity failure it
+is the STATIC branded placeholder — **never** the unverified bytes as the image. (The
+HTML error pages via `resolve().render()` stay for the webview/navigation case.)
+Low-level free functions (`resolve`, `resolveObjectUrl`) remain available.
 
 ### CORS note for consuming apps (Sage/Tauri)
 

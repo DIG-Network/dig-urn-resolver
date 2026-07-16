@@ -155,9 +155,13 @@ The front-door API is the branded `DigNetwork` class:
 - `new DigNetwork(endpoint?, connectUrl?)`.
 - `dig.resolve(urn) : Promise<{ outcome, bytes, contentType }>`, `outcome ∈
   "success" | "integrity_failure" | "unreachable"`.
-- `dig.resolveImageUrl(urn) : Promise<string>` — a `blob:` object URL for `<img
-  src>`; the security/unreachable page for a non-success outcome, NEVER unverified
-  bytes.
+- `dig.resolveImageUrl(urn) : Promise<string>` — an `<img src>` URL that ALWAYS
+  resolves (never throws for a normal failure): a `blob:` URL of the real verified
+  image on success, else a branded DIG error IMAGE as a `data:image/svg+xml;base64`
+  URI matching the failure (integrity / unreachable / not-found / invalid-URN /
+  generic). An `<img>` cannot render the HTML error docs, so these SVGs are the
+  image-path variant. FAIL-CLOSED: the integrity image is a STATIC branded
+  placeholder — unverified bytes are NEVER returned as the image.
 
 Low-level free functions `resolve(urn, endpoint?, connectUrl?)` and
 `resolveObjectUrl(urn, endpoint?, connectUrl?)` MAY also be exported (delegating to

@@ -42,6 +42,7 @@
 pub mod content_type;
 pub mod crypto;
 pub mod error;
+pub mod images;
 pub mod ladder;
 pub mod node;
 pub mod pages;

@@ -15,8 +15,10 @@
 //! - `dig.resolve(urn)` → `{ outcome, bytes: Uint8Array, contentType }`, `outcome ∈
 //!   "success" | "integrity_failure" | "unreachable"`. For a non-success outcome
 //!   `bytes` is the branded `text/html` page — never unverified content.
-//! - `dig.resolveImageUrl(urn)` → a `blob:` object URL for `<img src>`. On an
-//!   integrity failure it is the branded security page, NEVER the unverified bytes.
+//! - `dig.resolveImageUrl(urn)` → an `<img src>` URL. Success → a `blob:` URL of the
+//!   REAL verified image; ANY failure → a branded DIG error IMAGE (`data:image/svg+xml`)
+//!   so the `<img>` degrades gracefully. On an integrity failure it is the STATIC
+//!   branded placeholder, NEVER the unverified bytes.
 //!
 //! The lower-level free functions [`resolve`] / [`resolveObjectUrl`] remain
 //! available, but `DigNetwork` is the SDK front door (README + example use it).
@@ -191,13 +193,6 @@ fn outcome_to_result(outcome: &ResolveOutcome, connect_url: &str) -> ResolveResu
     }
 }
 
-/// Shape an outcome into a `blob:` object URL. `render` is the ONLY byte source, so
-/// an integrity failure yields the security page — NEVER the unverified content.
-fn outcome_to_object_url(outcome: &ResolveOutcome, connect_url: &str) -> Result<String, JsError> {
-    let rendered = outcome.render(connect_url);
-    object_url(&rendered.bytes, &rendered.content_type).map_err(|e| JsError::new(&e.to_string()))
-}
-
 // ---------------------------------------------------------------------------
 // Branded SDK front door — `DigNetwork`
 // ---------------------------------------------------------------------------
@@ -249,17 +244,30 @@ impl DigNetwork {
         Ok(outcome_to_result(&outcome, &connect_or_default(connect)))
     }
 
-    /// Resolve a DIG URN to a `blob:` object URL usable directly as an `<img src>` —
-    /// the Sage NFT-image path. On an integrity failure this is the branded security
-    /// page, NEVER the unverified bytes as an image; on unreachable, the branded
-    /// unreachable page. Revoke the URL (`URL.revokeObjectURL`) when done.
+    /// Resolve a DIG URN to an image URL usable directly as an `<img src>` — the
+    /// Sage NFT-image path. ALWAYS returns a usable image URL, never throwing for a
+    /// normal failure:
+    ///
+    /// * success → a `blob:` object URL of the REAL verified image (revoke it with
+    ///   `URL.revokeObjectURL` when done);
+    /// * any failure → a branded DIG error IMAGE as a `data:image/svg+xml` URI
+    ///   (an `<img>` cannot render the HTML error docs) — integrity failure, network
+    ///   unreachable, not-found, invalid URN, or a generic error.
+    ///
+    /// FAIL-CLOSED: on an integrity failure this is the STATIC branded placeholder
+    /// image — the tampered/unverified bytes are NEVER rendered as the image.
     #[wasm_bindgen(js_name = resolveImageUrl)]
     pub async fn resolve_image_url(&self, urn: String) -> Result<String, JsError> {
         let (endpoint, connect) = (self.endpoint.clone(), self.connect_url.clone());
-        let outcome = do_resolve(urn, endpoint, connect.clone())
-            .await
-            .map_err(|e| JsError::new(&e.to_string()))?;
-        outcome_to_object_url(&outcome, &connect_or_default(connect))
+        match do_resolve(urn, endpoint, connect).await {
+            // The real, verified image bytes as a blob URL.
+            Ok(ResolveOutcome::Success(data)) => object_url(&data.bytes, &data.content_type)
+                .map_err(|e| JsError::new(&e.to_string())),
+            // A non-success outcome → its branded error image (never the bytes).
+            Ok(other) => Ok(crate::images::data_uri(crate::images::for_outcome(&other))),
+            // A hard error → the matching branded error image (never throws here).
+            Err(e) => Ok(crate::images::data_uri(crate::images::for_error(&e))),
+        }
     }
 }
 
@@ -277,7 +285,8 @@ pub async fn resolve(
     DigNetwork::new(endpoint, connect_url).resolve(urn).await
 }
 
-/// Low-level: resolve to a `blob:` object URL. Prefer [`DigNetwork::resolveImageUrl`].
+/// Low-level: resolve to an `<img src>` URL (real blob on success, a branded error
+/// image on any failure). Prefer [`DigNetwork::resolveImageUrl`].
 #[wasm_bindgen(js_name = resolveObjectUrl)]
 pub async fn resolve_object_url(
     urn: String,

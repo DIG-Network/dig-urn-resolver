@@ -13,6 +13,10 @@
 //! const dig = new DigNetwork();
 //! img.src = await dig.resolveImageUrl(nftDataUri); // works node-absent (rpc fallback)
 //! ```
+//!
+//! `resolveImageUrl` always yields a usable `<img>` URL: the real verified image on
+//! success, else a branded DIG error image (integrity / unreachable / not-found /
+//! invalid-URN / generic) — never a broken image, and never the unverified bytes.
 
 use async_trait::async_trait;
 use base64::Engine;
