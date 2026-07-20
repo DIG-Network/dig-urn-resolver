@@ -1,6 +1,6 @@
 [package]
 name = "dig-urn-resolver"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.75.0"
 description = "Resolve a DIG URN to its data through the protocol (node-first ladder, verified + decrypted). Rust + wasm; first consumer: Sage wallet NFT images."
@@ -28,11 +28,18 @@ wasm = [
 ]
 
 [dependencies]
-# The COMPLETE read contract — URN canonicalization + retrieval-key derivation, the
-# MerkleProof codec + inclusion verify, `resource_leaf`, and the symmetric read-crypto
-# (`derive_decryption_key` + `decrypt_chunk`). `default-features = false` selects the pure
-# `alloc` core (no `blst`/BLS, no `getrandom`) so the SAME crate compiles for native AND
-# wasm — the single source of truth for the crypto, never reimplemented here.
+# The canonical `urn:dig:` scheme — parsing, canonicalization, and the
+# content-key / retrieval-key derivation + the browser verification contract
+# (`verify::{ContentCrypto, verify_and_decrypt}`). This is the single source of truth
+# for URN addressing, replacing digstore-core's parallel parser; the resolver's
+# wire/lookup key is `DigUrn::content_key()` (root-independent), NOT `retrieval_key()`.
+dig-urn-protocol = "0.1"
+
+# The read-crypto PRIMITIVES ONLY — the merkle `MerkleProof` codec + fold, `resource_leaf`,
+# and the symmetric read-crypto (`derive_decryption_key` + `decrypt_chunk`). Reused
+# byte-identically (never reimplemented) as the `ContentCrypto` backing for the
+# `dig-urn-protocol` verification contract. `default-features = false` selects the pure
+# `alloc` core (no `blst`/BLS, no `getrandom`) so the SAME crate compiles native AND wasm.
 digstore-core = { version = "0.13.4", default-features = false }
 
 async-trait = "0.1"

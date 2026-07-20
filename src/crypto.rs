@@ -1,123 +1,133 @@
-//! The rpc-path read-crypto — a thin orchestration over `digstore_core`.
+//! The rpc-path read-crypto — a thin orchestration over the canonical
+//! [`dig_urn_protocol::verify`] contract, backed by `digstore_core` primitives.
 //!
-//! Every primitive here (URN key derivation, AES-256-GCM-SIV open, merkle
-//! inclusion verify) is `digstore_core`'s — the SAME functions the browser
-//! read-crypto (`dig-client-wasm`) and the on-chain/format crates share, so this
-//! resolver can never skew from the canonical crypto. Nothing is reimplemented;
-//! this module only sequences the gate-then-decrypt pipeline and maps failures to
-//! the resolver's fail-closed [`ResolveError`] taxonomy.
+//! The verification LOGIC (rootless rejection, leaf-binding, path-fold, root-anchoring,
+//! gate-then-decrypt, the u64-bounded chunk split) lives in `dig-urn-protocol`, over crypto
+//! primitives it INJECTS via [`dig_urn_protocol::verify::ContentCrypto`]. This module supplies
+//! those primitives from `digstore_core` — the SAME merkle codec + fold and AES-256-GCM-SIV
+//! functions the on-chain/format crates and the browser read-crypto share — REUSED unchanged,
+//! never reimplemented, so the resolver can never skew from the canonical read-crypto. It also
+//! adapts the wire encodings (base64 proof, hex root, hex salt) and maps the protocol's
+//! fail-closed errors into the resolver's [`ResolveError`] taxonomy.
 //!
-//! The node transport does NOT use this module: the node decrypts + verifies
-//! server-side on the same machine and returns plaintext under a loopback trust
-//! boundary. This is only for the blind rpc fetch (ciphertext + proof over the
-//! public gateway), where the client MUST verify against the chain-anchored root
-//! itself.
+//! The node transport does NOT use this module: the node decrypts + verifies server-side on the
+//! same machine and returns plaintext under a loopback trust boundary. This is only for the blind
+//! rpc fetch (ciphertext + proof over the public gateway), where the client MUST verify against
+//! the chain-anchored root itself.
 
 use crate::error::{ResolveError, Result};
 use crate::urn::ParsedUrn;
 use base64::Engine;
+use dig_urn_protocol::verify::{self, ContentCrypto, FoldedProof};
+use dig_urn_protocol::{Bytes32, DigUrn, SecretSalt};
 use digstore_core::codec::Decode;
 use digstore_core::crypto::{decrypt_chunk, derive_decryption_key};
-use digstore_core::{resource_leaf, Bytes32, MerkleProof, SecretSalt};
+use digstore_core::MerkleProof;
 
-/// Parse a 32-byte secret salt from optional lowercase hex. `None`/empty ⇒ a
-/// public store (the URN alone derives the key).
-fn parse_salt(salt_hex: Option<&str>) -> Result<Option<[u8; 32]>> {
+/// The `digstore_core`-backed crypto primitives injected into the `dig-urn-protocol` verification
+/// contract. Every method here delegates to a canonical `digstore_core` function unchanged.
+struct DigstoreCrypto;
+
+impl ContentCrypto for DigstoreCrypto {
+    /// Decode the Chia big-endian streamable `MerkleProof` and fold its path. Returns `None`
+    /// (fail-closed) on any malformed encoding or internally-inconsistent path — the path-fold
+    /// rule lives in `digstore_core::MerkleProof::verify`.
+    fn decode_and_fold(&self, proof: &[u8]) -> Option<FoldedProof> {
+        let proof = MerkleProof::from_bytes(proof).ok()?;
+        if !proof.verify() {
+            return None;
+        }
+        Some(FoldedProof {
+            leaf: Bytes32(proof.leaf.0),
+            root: Bytes32(proof.root.0),
+        })
+    }
+
+    /// AES-256-GCM-SIV-open ONE chunk under the key derived from the URN's rootless canonical form
+    /// + optional salt. Returns `None` on an AEAD tag failure (fail-closed).
+    fn decrypt_chunk(
+        &self,
+        urn: &DigUrn,
+        salt: Option<&SecretSalt>,
+        chunk: &[u8],
+    ) -> Option<Vec<u8>> {
+        let canonical = urn.canonical_rootless().canonical();
+        let core_salt = salt.map(|s| digstore_core::SecretSalt(s.0));
+        let key = derive_decryption_key(&canonical, core_salt.as_ref());
+        decrypt_chunk(&key, chunk).ok()
+    }
+}
+
+/// Parse the optional lowercase-hex secret salt into a [`SecretSalt`]. `None`/empty ⇒ a public
+/// store (the URN alone derives the key). Reuses the canonical protocol validator (exactly 64 hex).
+fn parse_salt(salt_hex: Option<&str>) -> Result<Option<SecretSalt>> {
     match salt_hex {
         None => Ok(None),
         Some(s) if s.trim().is_empty() => Ok(None),
-        Some(s) => {
-            let b = Bytes32::from_hex(s.trim())
-                .map_err(|_| ResolveError::Parse("secret salt must be 64 hex chars".into()))?;
-            Ok(Some(b.0))
-        }
+        Some(s) => DigUrn::salt_bytes(s)
+            .map(Some)
+            .map_err(|_| ResolveError::Parse("secret salt must be 64 hex chars".into())),
     }
 }
 
-/// Decode a base64 merkle proof (the `inclusion_proof` field) into a
-/// [`MerkleProof`]. The wire encoding is the Chia big-endian streamable codec.
-fn decode_proof_b64(proof_b64: &str) -> Result<MerkleProof> {
-    let raw = base64::engine::general_purpose::STANDARD
+/// Decode the hex chain-anchored trusted root into a [`Bytes32`].
+fn parse_trusted_root(trusted_root_hex: &str) -> Result<Bytes32> {
+    Bytes32::from_hex(trusted_root_hex.trim())
+        .map_err(|_| ResolveError::VerifyFailed("trusted root must be 64 hex chars".into()))
+}
+
+/// Decode a base64 merkle proof (the `inclusion_proof` field) into its raw wire bytes.
+fn decode_proof_b64(proof_b64: &str) -> Result<Vec<u8>> {
+    base64::engine::general_purpose::STANDARD
         .decode(proof_b64.trim().as_bytes())
-        .map_err(|_| ResolveError::VerifyFailed("inclusion proof is not valid base64".into()))?;
-    MerkleProof::from_bytes(&raw)
-        .map_err(|_| ResolveError::VerifyFailed("inclusion proof encoding is invalid".into()))
+        .map_err(|_| ResolveError::VerifyFailed("inclusion proof is not valid base64".into()))
 }
 
-/// The integrity gate (Digstore §9.3): the served `ciphertext` must be the proof's
-/// leaf (`leaf = SHA-256(ciphertext)`), the path must fold to `proof.root`, and
-/// `proof.root` must equal the chain-anchored `trusted_root`. Any failure is a hard
-/// fail-closed [`ResolveError::VerifyFailed`] — a decoy / wrong-store / tampered
-/// response can never chain to the real root.
+/// Map a `dig-urn-protocol` fail-closed error into the resolver's own [`ResolveError`] taxonomy.
+/// The two enums are structurally identical; this keeps the resolver's public error type stable.
+fn map_err(err: dig_urn_protocol::ResolveError) -> ResolveError {
+    use dig_urn_protocol::ResolveError as P;
+    match err {
+        P::Parse(m) => ResolveError::Parse(m),
+        P::Transport(m) => ResolveError::Transport(m),
+        P::Rpc(m) => ResolveError::Rpc(m),
+        P::NotFound => ResolveError::NotFound,
+        P::RootRequired => ResolveError::RootRequired,
+        P::VerifyFailed(m) => ResolveError::VerifyFailed(m),
+        P::DecryptFailed => ResolveError::DecryptFailed,
+    }
+}
+
+/// The integrity gate (Digstore §9.3): the served `ciphertext` must be the proof's leaf
+/// (`leaf = SHA-256(ciphertext)`), the path must fold to `proof.root`, and `proof.root` must equal
+/// the chain-anchored `trusted_root`. Any failure is a hard fail-closed
+/// [`ResolveError::VerifyFailed`] — a decoy / wrong-store / tampered response can never chain to
+/// the real root.
 pub fn verify_inclusion(ciphertext: &[u8], proof_b64: &str, trusted_root_hex: &str) -> Result<()> {
-    let trusted_root = Bytes32::from_hex(trusted_root_hex.trim())
-        .map_err(|_| ResolveError::VerifyFailed("trusted root must be 64 hex chars".into()))?;
+    let trusted_root = parse_trusted_root(trusted_root_hex)?;
     let proof = decode_proof_b64(proof_b64)?;
-
-    if resource_leaf(ciphertext) != proof.leaf {
-        return Err(ResolveError::VerifyFailed(
-            "content does not match proof leaf (tampered ciphertext)".into(),
-        ));
-    }
-    if !proof.verify() {
-        return Err(ResolveError::VerifyFailed(
-            "merkle path does not resolve to the declared root".into(),
-        ));
-    }
-    if proof.root != trusted_root {
-        return Err(ResolveError::VerifyFailed(
-            "merkle root does not match the chain-anchored trusted root".into(),
-        ));
-    }
-    Ok(())
+    verify::verify_inclusion(&DigstoreCrypto, ciphertext, &proof, &trusted_root).map_err(map_err)
 }
 
-/// The confidentiality half: derive the URN key, split the plain-concatenated chunk
-/// ciphertexts by `chunk_lens` (per-chunk CIPHERTEXT byte lengths in order — no wire
-/// length framing) and AES-256-GCM-SIV-open each in order. An empty/absent
-/// `chunk_lens` is the common single-chunk resource. A tag failure fails closed with
-/// [`ResolveError::DecryptFailed`].
+/// The confidentiality half: derive the URN key and AES-256-GCM-SIV-open each chunk in order,
+/// splitting the plain-concatenated ciphertexts by `chunk_lens` (per-chunk CIPHERTEXT byte lengths;
+/// empty ⇒ the common single-chunk resource). The untrusted `chunk_lens` is u64-bounded so a
+/// crafted length can never wrap `usize` on wasm32 and slice out of bounds. A tag failure or an
+/// inconsistent plan fails closed with [`ResolveError::DecryptFailed`].
 pub fn decrypt(parsed: &ParsedUrn, ciphertext: &[u8], chunk_lens: &[u32]) -> Result<Vec<u8>> {
     let salt = parse_salt(parsed.salt.as_deref())?;
-    let canonical = parsed.canonical_rootless().canonical();
-    let aes_key = derive_decryption_key(&canonical, salt.map(SecretSalt).as_ref());
-
-    // `chunk_lens` is gateway/node-supplied and is NOT covered by the merkle proof, so
-    // it is UNTRUSTED. Accumulate + bound in u64 and slice against the REMAINING buffer
-    // so a crafted length (e.g. `[len+2^31, 2^31]`) can never wrap `usize` on wasm32 and
-    // slice out of bounds → `panic=abort` (wallet crash). Any inconsistency fails closed
-    // as `DecryptFailed` (→ IntegrityFailure), never a panic.
-    let ct_len = ciphertext.len() as u64;
-    let plan: Vec<u64> = if chunk_lens.is_empty() {
-        vec![ct_len]
-    } else {
-        chunk_lens.iter().map(|&l| l as u64).collect()
-    };
-    let mut total: u64 = 0;
-    for &len in &plan {
-        total = total.checked_add(len).ok_or(ResolveError::DecryptFailed)?;
-    }
-    if total != ct_len {
-        return Err(ResolveError::DecryptFailed);
-    }
-
-    let mut plaintext = Vec::with_capacity(ciphertext.len());
-    let mut p: usize = 0;
-    for len in plan {
-        // `total == ct_len` already bounds each `len`, but slice defensively anyway:
-        // reject any window that would exceed the remaining buffer.
-        let len = usize::try_from(len).map_err(|_| ResolveError::DecryptFailed)?;
-        let end = p.checked_add(len).filter(|&e| e <= ciphertext.len());
-        let end = end.ok_or(ResolveError::DecryptFailed)?;
-        let ct = &ciphertext[p..end];
-        p = end;
-        let pt = decrypt_chunk(&aes_key, ct).map_err(|_| ResolveError::DecryptFailed)?;
-        plaintext.extend_from_slice(&pt);
-    }
-    Ok(plaintext)
+    verify::decrypt(
+        &DigstoreCrypto,
+        &parsed.urn,
+        salt.as_ref(),
+        ciphertext,
+        chunk_lens,
+    )
+    .map_err(map_err)
 }
 
-/// Verify then decrypt (gate-then-decrypt): the full rpc read-crypto pipeline.
+/// Verify then decrypt (gate-then-decrypt): the full rpc read-crypto pipeline. Decryption is
+/// reached ONLY after inclusion verification passes.
 pub fn verify_and_decrypt(
     parsed: &ParsedUrn,
     ciphertext: &[u8],
@@ -125,8 +135,19 @@ pub fn verify_and_decrypt(
     trusted_root_hex: &str,
     chunk_lens: &[u32],
 ) -> Result<Vec<u8>> {
-    verify_inclusion(ciphertext, proof_b64, trusted_root_hex)?;
-    decrypt(parsed, ciphertext, chunk_lens)
+    let salt = parse_salt(parsed.salt.as_deref())?;
+    let trusted_root = parse_trusted_root(trusted_root_hex)?;
+    let proof = decode_proof_b64(proof_b64)?;
+    verify::verify_and_decrypt(
+        &DigstoreCrypto,
+        &parsed.urn,
+        salt.as_ref(),
+        ciphertext,
+        &proof,
+        &trusted_root,
+        chunk_lens,
+    )
+    .map_err(map_err)
 }
 
 #[cfg(test)]
@@ -139,8 +160,8 @@ mod tests {
 
     #[test]
     fn decrypt_rejects_overflowing_chunk_lens_without_panic() {
-        // `[len+2^31, 2^31]` wraps usize on wasm32; the u64-checked total must reject
-        // it cleanly (fail-closed), never slice out of bounds / panic.
+        // `[len+2^31, 2^31]` wraps usize on wasm32; the u64-checked total must reject it cleanly
+        // (fail-closed), never slice out of bounds / panic.
         let ct = vec![0u8; 10];
         let bad = [(1u32 << 31) + 10, 1u32 << 31];
         assert!(matches!(
@@ -156,5 +177,17 @@ mod tests {
             decrypt(&urn(), &ct, &[999]),
             Err(ResolveError::DecryptFailed)
         ));
+    }
+
+    #[test]
+    fn verify_inclusion_rejects_invalid_base64_proof() {
+        let err = verify_inclusion(&[0u8; 4], "not base64!!", &"11".repeat(32)).unwrap_err();
+        assert!(matches!(err, ResolveError::VerifyFailed(_)));
+    }
+
+    #[test]
+    fn verify_inclusion_rejects_bad_trusted_root() {
+        let err = verify_inclusion(&[0u8; 4], "AAAA", "not-hex").unwrap_err();
+        assert!(matches!(err, ResolveError::VerifyFailed(_)));
     }
 }

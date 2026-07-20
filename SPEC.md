@@ -33,19 +33,27 @@ urn:dig:chia:<store_id>[:<root>]/<resource_key>[?salt=<hex>]
   is NOT rejected — it names the store's landing page).
 - `?salt=<hex>` — OPTIONAL out-of-band private-store secret salt.
 
-Parsing MUST reuse the canonical `digstore-core` URN parser for the
-`urn:dig:<chain>:<store>[:<root>]/<key>` portion; the `?salt=` suffix is split off
-first. A syntactically invalid URN MUST produce a hard parse error.
+Parsing MUST reuse the canonical `dig-urn-protocol` URN parser
+(`DigUrn::parse_with_salt`) for the `urn:dig:<chain>:<store>[:<root>]/<key>[?salt=<hex>]`
+scheme — the single source of truth for the grammar, pinned by the frozen conformance
+corpus (`dig-urn-protocol/tests/fixtures/urn_conformance.json`). A syntactically invalid
+URN MUST produce a hard parse error.
 
 ## 3. Keys (reused, root-independent)
 
 - `retrieval_key = SHA-256(canonical_rootless_urn)`, where the canonical rootless URN
-  is `urn:dig:chia:<store_id>/<resource_key>` (root dropped).
+  is `urn:dig:chia:<store_id>/<resource_key>` (root dropped). This is the ecosystem's
+  on-wire lookup key (the value the node indexes as `retrieval_key`), and it is
+  `dig_urn_protocol::DigUrn::content_key()` — NOT `DigUrn::retrieval_key()`, which is a
+  DIFFERENT, root-PINNED hash. Implementations MUST map the resolver's `retrieval_key`
+  to `content_key`.
 - `decryption_key = digstore_core::crypto::derive_decryption_key(canonical_rootless_urn,
   salt?)` (HKDF-SHA256, paper §11).
 
-Both are root-independent so they are stable across generations. Implementations MUST
-NOT reimplement these; they MUST call `digstore-core`.
+Both are root-independent so they are stable across generations. Implementations MUST NOT
+reimplement these: the URN scheme + `content_key`/`retrieval_key` derivation come from
+`dig-urn-protocol`, and the merkle codec/fold + symmetric read-crypto primitives come from
+`digstore-core` (injected via `dig_urn_protocol::verify::ContentCrypto`, reused unchanged).
 
 ## 4. The §5.3 ladder — node trust is LOOPBACK-ONLY
 
@@ -205,7 +213,12 @@ Low-level free functions `resolve(urn, endpoint?, connectUrl?)` and
 
 ## 10. Conformance
 
-- URN parse + retrieval/decryption keys MUST match `digstore-core` byte-for-byte.
+- URN parse MUST match `dig-urn-protocol` byte-for-byte (the frozen conformance corpus);
+  the retrieval key MUST equal `dig_urn_protocol::DigUrn::content_key` and the decryption
+  key MUST match `digstore-core` byte-for-byte. A cross-parser equivalence test
+  (`tests/cross_parser_equivalence.rs`) pins the wire key against both parsers over the
+  frozen corpus, including a root-pinned URN (guarding the `content_key` vs `retrieval_key`
+  trap).
 - A tampered ciphertext, a non-chaining proof, a wrong root, or a wrong/absent salt
   MUST yield `IntegrityFailure`, never data.
 - Only an asserted-loopback host is granted node trust; a remote host (incl. an
