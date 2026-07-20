@@ -6,14 +6,8 @@ This project adheres to [Semantic Versioning](https://semver.org) and
 
 ## [0.4.0] - 2026-07-20
 
-### Changed
-- Consume `dig-urn-protocol` (crates.io `0.1`) as the canonical `urn:dig:` parser and
-  verification contract, retiring digstore-core's parallel URN parse (kills a two-parser
-  drift). digstore-core is kept ONLY as the crypto-primitive backing (merkle codec/fold +
-  symmetric read-crypto), reused byte-identically via `ContentCrypto`. The resolver's
-  wire/lookup key maps to `DigUrn::content_key` (root-independent), NOT `retrieval_key`
-  (root-pinned) — pinned by a new frozen-corpus cross-parser equivalence test. No wire
-  change; reads are byte-identical.
+### Refactor
+- Consume dig-urn-protocol as the canonical urn:dig: parser (#7)
 
 ## [0.3.1] - 2026-07-16
 
