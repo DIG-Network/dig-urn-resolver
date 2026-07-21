@@ -626,6 +626,48 @@ async fn wrong_salt_on_node_ciphertext_path_is_integrity_failure() {
     assert_eq!(outcome, ResolveOutcome::IntegrityFailure);
 }
 
+#[tokio::test]
+async fn rootless_urn_over_node_ciphertext_derives_root_from_header() {
+    // #1432: a ROOTLESS URN resolved over a healthy loopback node that answers with
+    // CIPHERTEXT (not attested plaintext) must still succeed — the client derives its
+    // trust root from the node's `X-Dig-Root` header (`node.rs::fetch`, `node_root`),
+    // then verifies+decrypts against THAT root exactly as the root-pinned path does.
+    // This locks the rootless-over-loopback contract for the ciphertext branch; the
+    // plaintext branch is already covered by `node_tier_serves_when_healthy`.
+    let fx = build_fixture(IMG_KEY, b"rootless node ciphertext art", None);
+    let t = MockTransport::new(
+        Box::new(move |url: &str| {
+            if url.ends_with("/health") {
+                Ok(status(200))
+            } else {
+                Ok(node_ciphertext_response(&fx))
+            }
+        }),
+        Box::new(|_u, _b| Err(transport_err())),
+    );
+    let data = success(
+        Resolver::new(t)
+            .resolve(&rootless_urn(IMG_KEY))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(data.bytes, b"rootless node ciphertext art");
+}
+
+#[tokio::test]
+async fn rootless_urn_falls_to_rpc_root_required_when_node_unhealthy() {
+    // #1432: the rootless-over-loopback trust anchor is the NODE — with no healthy
+    // loopback node, the ladder falls to the untrusted rpc gateway, which can never
+    // be trusted with a chain-anchored root for a rootless URN. The wall must still
+    // hold: hard `RootRequired`, never falling back to an unverifiable resolve.
+    let fx = build_fixture(IMG_KEY, b"unused", None);
+    let err = Resolver::new(rpc_serving(fx))
+        .resolve(&rootless_urn(IMG_KEY))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ResolveError::RootRequired));
+}
+
 // --- caching ---------------------------------------------------------------
 
 #[tokio::test]

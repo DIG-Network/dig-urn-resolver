@@ -128,6 +128,16 @@ headers (never assumed):
   separated) gives the chunk layout. A node returning ciphertext is NOT trusted blindly.
 - `2xx` that is neither attested plaintext nor decryptable ciphertext → hard
   `VerifyFailed` (fail-closed; §6 `IntegrityFailure`). Bytes are never returned.
+- **Rootless resolution over this tier** — a rootless URN is served as
+  `GET {base}/s/<store_id>/<resource_key>` (no `:<root>`); the node resolves the
+  store's current chain-anchored tip itself and reports it back via `X-Dig-Root`
+  (both response shapes above). The client trusts that header as the resolve's root
+  ONLY because this is the asserted-loopback node (never over rpc, §5.2 step 1); the
+  ciphertext shape is still fully client-verified against it (gate-then-decrypt, same
+  as a pinned root) — the node is trusted to NAME the tip, never to attest unverified
+  bytes. A rootless URN with no healthy loopback node falls through the ladder to the
+  rpc tier, which rejects it with `RootRequired` (§4.1, §5.2 step 1) — the wall never
+  opens just because the node tier was unavailable.
 - `404` → `NotFound` (content absent at this tier; the ladder falls through to the
   next tier — §4.1).
 - other non-2xx / transport failure → a transport failure (ladder falls through).
@@ -268,6 +278,11 @@ Low-level free functions `resolve(urn, endpoint?, connectUrl?)` and
 - A node CIPHERTEXT response MUST be client-side verified+decrypted (not trusted); a
   salted URN MUST decrypt salted content on BOTH tiers, and a wrong/absent salt MUST
   yield `IntegrityFailure`.
+- A ROOTLESS URN resolved over a healthy loopback node returning CIPHERTEXT MUST
+  derive its trust root from `X-Dig-Root` and verify+decrypt against it to `Success`;
+  the same rootless URN with no healthy loopback node MUST fall through to the rpc
+  tier and be rejected `RootRequired` — the node is the ONLY tier ever trusted to
+  resolve a rootless URN's tip.
 - Caching (§11) MUST NOT weaken fail-closed: only `Success` is cached; a disk hit is
   re-verified (a tampered file → `IntegrityFailure`).
 
