@@ -146,22 +146,89 @@ async fn node_content_type_falls_back_to_extension_when_header_absent() {
 }
 
 #[tokio::test]
-async fn node_404_is_fail_closed_not_found() {
+async fn node_404_falls_through_to_rpc_which_serves() {
+    // #855 PRIMARY: the local node genuinely lacks the content (clean 404) — the
+    // stranger's common case. The ladder MUST fall through to the rpc gateway that
+    // HAS it, not abort at the local tier. Root-pinned so the rpc tier can verify.
+    let fx = build_fixture(IMG_KEY, b"gateway has it", None);
+    let root = fx.root_hex.clone();
+    let t = MockTransport::new(
+        Box::new(|url: &str| {
+            if url.ends_with("/health") {
+                Ok(status(200)) // a local node IS up …
+            } else {
+                Ok(status(404)) // … but does not hold this resource
+            }
+        }),
+        Box::new(move |_u: &str, body: &str| {
+            let req: serde_json::Value = serde_json::from_str(body).unwrap();
+            match req["method"].as_str().unwrap() {
+                "dig.getContent" => Ok(rpc_ok(get_content_result(&fx))),
+                other => panic!("unexpected method {other}"),
+            }
+        }),
+    );
+    let data = success(
+        Resolver::new(t)
+            .resolve(&root_pinned_urn(IMG_KEY, &root))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(data.bytes, b"gateway has it");
+}
+
+#[tokio::test]
+async fn all_tiers_not_found_is_branded_final_not_found() {
+    // #855: local 404 AND the gateway reports absence → ONE branded final NotFound
+    // (not Unreachable, not a raw per-tier error). The content genuinely does not
+    // exist anywhere reachable.
     let t = MockTransport::new(
         Box::new(|url: &str| {
             if url.ends_with("/health") {
                 Ok(status(200))
             } else {
-                Ok(status(404))
+                Ok(status(404)) // node: absent
             }
         }),
-        Box::new(|_u, _b| Err(transport_err())),
+        // gateway: total_length 0 ⇒ NotFound
+        Box::new(|_u: &str, _b: &str| Ok(rpc_ok(serde_json::json!({ "total_length": 0 })))),
     );
     let err = Resolver::new(t)
-        .resolve(&rootless_urn(IMG_KEY))
+        .resolve(&pinned(IMG_KEY))
         .await
         .unwrap_err();
     assert!(matches!(err, ResolveError::NotFound));
+}
+
+#[tokio::test]
+async fn integrity_failure_at_node_tier_never_queries_rpc() {
+    // #855 SECURITY: a tampered/unverified response at tier 1 MUST fail closed
+    // IMMEDIATELY — it must NEVER fall through to another tier (that would let an
+    // attacker turn a tampered tier-1 response into a silent retry serving
+    // attacker-chosen bytes, §5.4). The rpc post MUST never be reached: the gateway
+    // closure PANICS if the ladder tries it after the integrity failure.
+    let t = MockTransport::new(
+        Box::new(|url: &str| {
+            if url.ends_with("/health") {
+                Ok(status(200))
+            } else {
+                // 200 bytes with NO X-Dig-Verified ⇒ node did not attest ⇒ VerifyFailed.
+                Ok(node_response(
+                    b"unverified".to_vec(),
+                    Some("text/plain"),
+                    false,
+                ))
+            }
+        }),
+        Box::new(|url: &str, _b: &str| {
+            panic!("integrity failure must NOT fall through to rpc: {url}")
+        }),
+    );
+    let outcome = Resolver::new(t)
+        .resolve(&rootless_urn(IMG_KEY))
+        .await
+        .unwrap();
+    assert_eq!(outcome, ResolveOutcome::IntegrityFailure);
 }
 
 // --- ladder: rpc fallback when no node -------------------------------------
