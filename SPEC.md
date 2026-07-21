@@ -83,6 +83,32 @@ names (e.g. a browser) MUST treat a non-literal, non-`localhost` name as NON-loo
   loopback node tier is healthy, else `[rpc(rpc.dig.net)]`.
 - The resolved plan SHOULD be cached per resolver instance.
 
+### 4.1 Cross-tier error classification — fall through on ABSENCE, fail closed on INTEGRITY
+
+Walking the plan, a per-tier failure is classified into exactly one of three actions.
+Getting this split right is a SECURITY property, not a convenience:
+
+- **TRY NEXT TIER (fall through)** — a tier's `NotFound` (content genuinely absent
+  here — a node `404`, or a gateway `total_length == 0`) OR its transport failure
+  (tier unreachable). This is the stranger's common case: the local node does not hold
+  the content, so the ladder MUST continue to the public gateway that does. A local
+  `NotFound` MUST NOT abort the ladder.
+  - When EVERY tier returns `NotFound`, the resolve yields ONE branded final
+    `ResolveError::NotFound` (the content exists nowhere reachable) — not `Unreachable`,
+    not a raw per-tier error.
+  - When the LAST tier is transport-unreachable, the resolve yields
+    `ResolveOutcome::Unreachable` (§6).
+- **ABORT THE WHOLE LADDER IMMEDIATELY (fail closed)** — a tier's `VerifyFailed` /
+  `DecryptFailed` (integrity: tampered bytes, a non-chaining proof, a wrong root, a
+  decrypt-tag failure). This is surfaced as `ResolveOutcome::IntegrityFailure` and MUST
+  NEVER fall through to another tier. Falling through after an integrity failure would
+  let an attacker turn a tampered response at one tier into a silent retry that serves
+  attacker-chosen bytes from another — the exact fail-closed hole this rule forbids
+  (superproject CLAUDE.md §5.4).
+- **SURFACE A HARD ERROR** — a reachable protocol error (`Rpc`) or a `RootRequired`
+  (rootless URN over the untrusted gateway) — returned as a hard `Err` (§6). Not
+  absence, not unreachability, not integrity.
+
 ## 5. Read paths
 
 ### 5.1 Node path (`EndpointKind::Node`) — loopback only
@@ -102,7 +128,8 @@ headers (never assumed):
   separated) gives the chunk layout. A node returning ciphertext is NOT trusted blindly.
 - `2xx` that is neither attested plaintext nor decryptable ciphertext → hard
   `VerifyFailed` (fail-closed; §6 `IntegrityFailure`). Bytes are never returned.
-- `404` → hard `NotFound`.
+- `404` → `NotFound` (content absent at this tier; the ladder falls through to the
+  next tier — §4.1).
 - other non-2xx / transport failure → a transport failure (ladder falls through).
 
 ### 5.2 RPC path (`EndpointKind::Rpc`) — the trust root comes from the URN
@@ -116,7 +143,7 @@ headers (never assumed):
 3. Stream windowed `dig.getContent {store_id, root, retrieval_key, offset, length} ->
    {total_length, offset, next_offset?, complete?, ciphertext (b64), inclusion_proof
    (b64), chunk_lens}`, accumulating ciphertext until `complete` or `next_offset ==
-   null`. `total_length == 0` → hard `NotFound`.
+   null`. `total_length == 0` → `NotFound` (absent at this tier; falls through — §4.1).
 4. **Verify then decrypt** (gate-then-decrypt), via `digstore-core`:
    - inclusion: `resource_leaf(ciphertext) == proof.leaf`, `proof.verify()`, and
      `proof.root == trusted_root`. ANY failure → integrity failure (§6).
@@ -138,10 +165,13 @@ A resolve yields `Result<ResolveOutcome, ResolveError>`:
   unreachable).
 - `ResolveOutcome::Unreachable` — every tier was transport-unreachable; nothing was
   fetched.
-- `Err(ResolveError)` — `Parse`, `NotFound`, `RootRequired` (a rootless URN over the
-  untrusted rpc tier), or `Rpc` (a reachable protocol error).
+- `Err(ResolveError)` — `Parse`, `NotFound` (the branded final not-found after EVERY
+  tier reported absence — §4.1), `RootRequired` (a rootless URN over the untrusted rpc
+  tier), or `Rpc` (a reachable protocol error).
 
-`IntegrityFailure` and `Unreachable` MUST be distinct and never conflated:
+A per-tier `NotFound` MUST NOT abort the ladder — it falls through (§4.1); only an
+integrity failure aborts. `IntegrityFailure` and `Unreachable` MUST be distinct and
+never conflated:
 integrity-fail = reached the network, bytes don't verify (security); unreachable =
 couldn't reach the network (retryable).
 
@@ -228,6 +258,13 @@ Low-level free functions `resolve(urn, endpoint?, connectUrl?)` and
   MUST NOT call `dig.getAnchoredRoot`.
 - Node-absent + a serving rpc gateway MUST resolve a valid ROOT-PINNED resource to
   `Success`.
+- A local-tier `NotFound` (node `404`) MUST fall through to the next tier: a healthy
+  node that lacks the resource + a serving gateway that has it MUST resolve to
+  `Success` (§4.1). When EVERY tier reports absence the result MUST be one branded
+  `NotFound`.
+- An integrity failure (`VerifyFailed` / `DecryptFailed`) at ANY tier MUST abort the
+  whole ladder as `IntegrityFailure` and MUST NOT be retried on a later tier — a
+  tampered response MUST NOT become a silent retry that serves other bytes (§4.1, §5.4).
 - A node CIPHERTEXT response MUST be client-side verified+decrypted (not trusted); a
   salted URN MUST decrypt salted content on BOTH tiers, and a wrong/absent salt MUST
   yield `IntegrityFailure`.

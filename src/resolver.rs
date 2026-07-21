@@ -270,11 +270,17 @@ impl<T: HttpTransport + ?Sized> Resolver<T> {
     /// already verified); a disk hit is RE-VERIFIED against the URN's root (a
     /// tampered file → `IntegrityFailure`). Only verified `Success` bytes are cached.
     ///
-    /// On a miss it walks the ladder plan: a tier's TRANSPORT failure falls through;
-    /// the LAST tier transport-unreachable → [`ResolveOutcome::Unreachable`]; a
-    /// verify/decrypt failure at any tier → [`ResolveOutcome::IntegrityFailure`]
-    /// IMMEDIATELY (never cascaded/masked); a malformed URN / not-found / rpc
-    /// protocol error → a hard `Err`.
+    /// On a miss it walks the ladder plan, falling through to the next tier on genuine
+    /// ABSENCE or unreachability but NEVER on an integrity failure:
+    /// * a tier's NOT-FOUND (content absent here) falls through; every tier not-found →
+    ///   one branded [`ResolveError::NotFound`] (the stranger's common case: the local
+    ///   node lacks it, the public gateway serves it).
+    /// * a tier's TRANSPORT failure falls through; the LAST tier transport-unreachable
+    ///   → [`ResolveOutcome::Unreachable`].
+    /// * a verify/decrypt failure at ANY tier → [`ResolveOutcome::IntegrityFailure`]
+    ///   IMMEDIATELY, aborting the whole ladder (never cascaded/masked/retried — a
+    ///   tampered tier must not become a silent retry on another, §5.4 fail-closed).
+    /// * a malformed URN / reachable rpc protocol error → a hard `Err`.
     pub async fn resolve(&self, urn: &str) -> Result<ResolveOutcome> {
         let parsed = ParsedUrn::parse(urn)?;
 
@@ -304,18 +310,33 @@ impl<T: HttpTransport + ?Sized> Resolver<T> {
                     return Ok(ResolveOutcome::Success(fetched.data));
                 }
                 // Reached the endpoint, bytes failed integrity → hard security
-                // fail-closed. Distinct from unreachable; never cascade or mask.
+                // fail-closed. This aborts the WHOLE ladder IMMEDIATELY and is NEVER
+                // downgraded to try-next: falling through after a tampered response
+                // would let an attacker turn a poisoned tier into a silent retry that
+                // serves attacker-chosen bytes from another tier (§5.4). Only genuine
+                // absence / unreachability (below) may fall through — never integrity.
                 Err(ResolveError::VerifyFailed(_)) | Err(ResolveError::DecryptFailed) => {
                     return Ok(ResolveOutcome::IntegrityFailure)
                 }
-                // Transport-unreachable: fall through; at the last tier the whole
-                // network is down → the friendly unreachable outcome.
+                // Genuine ABSENCE at this tier: the content is simply not held here
+                // (a clean 404 / empty gateway result). The stranger's common case —
+                // the local node lacks it, the public gateway has it — so fall through
+                // to the next tier. Exhausted at the last tier → ONE branded NotFound.
+                Err(ResolveError::NotFound) => {
+                    if i == last {
+                        return Err(ResolveError::NotFound);
+                    }
+                }
+                // Transport-unreachable at this tier: fall through; at the last tier the
+                // whole network is down → the friendly, retryable unreachable outcome.
                 Err(ResolveError::Transport(_)) => {
                     if i == last {
                         return Ok(ResolveOutcome::Unreachable);
                     }
                 }
-                // Not-found / rpc protocol error: a hard, reachable error.
+                // A reachable PROTOCOL error (malformed rpc response / rootless URN over
+                // the untrusted gateway) — not absence, not unreachable, not integrity.
+                // A hard, surfaced error.
                 Err(other) => return Err(other),
             }
         }
