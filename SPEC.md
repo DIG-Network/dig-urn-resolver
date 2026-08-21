@@ -11,13 +11,17 @@ dig-node read wire (`SYSTEM.md`).
 Resolve a DIG URN to the bytes + content type of the resource it names, verifying
 integrity fail-closed, following the §5.3 node-first ladder.
 
-This crate is the CANONICAL, project-wide client-side URN→data resolver (#668): hub,
-the extension, dig-sdk, dig-dns and other consumers converge on it. It sits strictly
+This crate is INTENDED as the canonical, project-wide client-side URN→data resolver
+(#668). Its consumers today are the Rust crate (`dig-node-service`) and the wasm/npm
+package `@dignetwork/dig-urn-resolver` (consumed by `dig-web-resolver`); hub.dig.net,
+the Chrome extension and `dig-sdk` parse URNs with their own implementations and
+consume neither package. That convergence is tracked work, NOT a current invariant
+(`dig_ecosystem#2725` / `#2753`); a new consumer MUST use this crate rather than add a
+parser. It sits strictly
 UPSTREAM of dig-node — a *client* that talks to a dig-node over the wire (node `/s/` +
 `/health`, else the rpc gateway). dig-node performs all heavy lifting (sync, serve,
 decrypt, chain anchoring) and MUST NOT depend on this crate. Consumers use the Rust
-crate or `@dignetwork/dig-urn-resolver` (JS/wasm); URN resolution is not reimplemented
-elsewhere.
+crate or `@dignetwork/dig-urn-resolver` (JS/wasm).
 
 ## 2. URN grammar
 

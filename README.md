@@ -6,9 +6,14 @@ images**.
 
 ## Positioning — the canonical client-side URN resolver
 
-This is **THE** canonical, project-wide client-side URN→data resolver (the #668
-convergence: hub, the extension, dig-sdk, dig-dns and other consumers converge on
-it). It sits strictly **upstream of dig-node**: it is a *client* that talks to a
+This crate is **intended** as the canonical, project-wide client-side URN→data
+resolver (the #668 convergence). Today its consumers are the Rust crate
+(`dig-node-service`) and the wasm/npm package `@dignetwork/dig-urn-resolver`
+(consumed by `dig-web-resolver`); hub.dig.net, the Chrome extension and `dig-sdk`
+still parse URNs with their own implementations and consume neither package, so the
+convergence is tracked work rather than a property you may assume
+(`dig_ecosystem#2725` / `#2753`). Bring a new consumer here rather than adding
+another parser. It sits strictly **upstream of dig-node**: it is a *client* that talks to a
 dig-node over the wire (the node `/s/` + `/health` surface, else the `rpc.dig.net`
 gateway) — dig-node does all the heavy lifting (store sync, serve, decrypt, chain
 anchoring) and **never depends on this crate**. Consume it from Rust (`dig-urn-resolver`)
@@ -33,8 +38,8 @@ first tier that responds:
 
 All read-crypto (URN canonicalization + retrieval-key derivation, merkle inclusion
 verify, AES-256-GCM-SIV open) is reused verbatim from `digstore-core` — the same
-functions the browser read-crypto and the on-chain crates share — so this crate can
-never skew from the canonical crypto.
+functions the on-chain crates share — so consumers **of this crate** cannot skew from
+the canonical crypto, or from each other.
 
 ## Security invariants
 
