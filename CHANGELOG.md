@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.5.2] - 2026-08-21
+
+### Documentation
+- **urn:** Correct false claim that SDKs/hub/extension share this parser (#10)
+
 ## [0.5.1] - 2026-07-21
 
 ### Testing
