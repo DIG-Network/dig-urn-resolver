@@ -1,6 +1,6 @@
 //! DIG URN parsing — a thin wrapper over the canonical [`dig_urn_protocol::DigUrn`].
 //!
-//! Grammar (canonical; matches the SDK/extension/hub parser byte-for-byte):
+//! Grammar (canonical; pinned by the `dig-urn-protocol` frozen conformance corpus):
 //!
 //! ```text
 //! urn:dig:chia:<store_id>[:<root>]/<resource_key>[?salt=<hex>]
@@ -15,10 +15,24 @@
 //!   resolves to the §8.5 default view `index.html`.
 //! * `?salt=<hex>` — OPTIONAL out-of-band secret salt for a PRIVATE store.
 //!
-//! [`dig_urn_protocol::DigUrn`] is the single source of truth for the scheme — the same
-//! parser the SDK, extension, hub, and node share — so this resolver can never skew from
-//! the canonical addressing. This module adds only the resolver-facing conveniences; it
-//! reimplements no parsing or key derivation.
+//! ## The source of truth, and where its guarantee stops
+//!
+//! [`dig_urn_protocol::DigUrn`] is the single source of truth for the scheme *within this
+//! crate*: this module adds only the resolver-facing conveniences and reimplements no
+//! parsing or key derivation. So every caller of this crate maps a given URN to an
+//! identical store id, root, resource key and wire key — callers cannot skew from each
+//! other. That guarantee stops at the crate boundary: it binds code that calls here, and
+//! says nothing about a parser that does not.
+//!
+//! Those callers today are the Rust crate (`dig-node-service`) and the wasm/npm package
+//! `@dignetwork/dig-urn-resolver` (consumed by `dig-web-resolver`). The remaining
+//! TypeScript surfaces — `dig-sdk`, the Chrome extension, and hub.dig.net — parse URNs
+//! with their own implementations and consume neither package, so the ecosystem currently
+//! runs several independent parsers with at least one measured key-derivation divergence
+//! between them. Converging those surfaces onto this crate is the intent and is tracked as
+//! `dig_ecosystem#2725` / `#2753`; until it lands, cross-surface agreement is a property to
+//! verify against the conformance corpus, not one to assume. Extend this crate (and the
+//! wasm package it publishes) rather than adding another parser.
 //!
 //! ## The wire key is `content_key`, never `retrieval_key`
 //!
