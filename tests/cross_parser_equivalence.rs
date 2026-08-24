@@ -120,3 +120,5 @@ fn root_pinned_urns_prove_content_key_not_retrieval_key() {
         "the corpus must exercise at least one root-pinned URN (the trap)"
     );
 }
+
+// WIP (dig_ecosystem#2753): the layer-boundary conformance battery lands here.
