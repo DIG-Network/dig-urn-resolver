@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.5.3] - 2026-08-24
+
+### Testing
+- **urn:** Pin the two-layer URN grammar contract with a control + abuse battery (#11)
+
 ## [0.5.2] - 2026-08-21
 
 ### Documentation
