@@ -1,6 +1,6 @@
 [package]
 name = "dig-urn-resolver"
-version = "0.5.2"
+version = "0.5.3"
 edition = "2021"
 rust-version = "1.75.0"
 description = "Resolve a DIG URN to its data through the protocol (node-first ladder, verified + decrypted). Rust + wasm; first consumer: Sage wallet NFT images."
@@ -79,6 +79,9 @@ web-sys = { version = "0.3", optional = true, features = [
 # Drives the wasm disk-cache test under `wasm-pack test --node` (feature `wasm`).
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
+# The conformance battery pins the vendored corpus rows by SHA-256 digest, so a silent
+# edit to a frozen vector is caught rather than inherited.
+sha2 = "0.10"
 
 # The native integration tests run on a multi-thread tokio runtime; tokio's full
 # runtime is not wasm-compatible, so scope this dev-dep to non-wasm targets (the wasm
