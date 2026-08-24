@@ -58,7 +58,11 @@ fn canonical_layer_reproduces_every_frozen_column() {
         let input = vector["input"].as_str().expect("vector has an input");
         let urn = DigUrn::parse(input).unwrap_or_else(|e| panic!("{name}: must parse: {e}"));
 
-        assert_eq!(urn.chain, vector["chain"].as_str().unwrap(), "{name}: chain");
+        assert_eq!(
+            urn.chain,
+            vector["chain"].as_str().unwrap(),
+            "{name}: chain"
+        );
         assert_eq!(
             urn.store_id_hex(),
             vector["store_id_hex"].as_str().unwrap(),
@@ -136,7 +140,11 @@ fn edge_layer_peels_salt_and_canonical_layer_does_not() {
 
     // Edge layer: the salt is peeled OUT of the resource.
     let edge = ParsedUrn::parse(&salted).expect("edge layer parses the salted string");
-    assert_eq!(edge.salt.as_deref(), Some("deadbeef"), "edge layer extracts");
+    assert_eq!(
+        edge.salt.as_deref(),
+        Some("deadbeef"),
+        "edge layer extracts"
+    );
     assert_eq!(
         edge.resource_key(),
         "index.html",

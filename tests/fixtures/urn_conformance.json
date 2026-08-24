@@ -1,5 +1,5 @@
 {
-  "_comment": "FROZEN normative URN conformance vectors (gap #128). Grammar: digstore_core::urn_grammar (URN_ABNF). Regenerate via `cargo test -p digstore-core --test urn_conformance -- --ignored regenerate`. retrieval_key_hex = SHA-256(canonical) lowercase hex.",
+  "_comment": "CANONICAL-LAYER conformance vectors for the urn:dig: scheme. Layer: canonical identity + key derivation (dig_urn_protocol::DigUrn::parse) -- the input column is an ALREADY-PEELED URN, so ?salt= is literal resource bytes here and NOT a salt; the edge layer (ParsedUrn::parse) peels it and is specified in SPEC.md section 2.1. This file is a byte-mirror of dig-urn-protocol/tests/fixtures/urn_conformance.json, vendored because include_str! cannot cross a crate boundary; change vectors THERE and re-vendor -- tests/urn_layer_contract.rs pins these rows by SHA-256 so a local edit fails loudly. retrieval_key_hex = SHA-256(canonical), root-PINNED; the wire/lookup key is the root-INDEPENDENT content_key.",
   "canonical_chain": "chia",
   "invalid": [
     {

@@ -26,22 +26,55 @@ crate or `@dignetwork/dig-urn-resolver` (JS/wasm).
 ## 2. URN grammar
 
 ```
-urn:dig:chia:<store_id>[:<root>]/<resource_key>[?salt=<hex>]
+urn:dig:<chain>:<store_id>[:<root>][/<resource_key>][?salt=<hex>]
 ```
 
-- `store_id` — 64 lowercase hex chars (singleton launcher id). REQUIRED.
+- `chain` — a non-empty label. `chia` is CANONICAL. `mainnet` and `testnet` MUST also be
+  accepted: `.dig` content is permanently on-chain-anchored, so a URN already published
+  under a non-canonical label MUST keep resolving. An EMPTY chain token is invalid.
+- `store_id` — 64 hex chars (singleton launcher id). REQUIRED.
 - `root` — OPTIONAL 64 hex chars pinning one on-chain generation. The root is the
   trust anchor for inclusion verification ONLY; it is NOT a key input.
-- `resource_key` — the path within the store. An ABSENT or empty resource path
-  resolves to the §8.5 default view `index.html` (a bare-store or trailing-slash URN
-  is NOT rejected — it names the store's landing page).
-- `?salt=<hex>` — OPTIONAL out-of-band private-store secret salt.
+- `resource_key` — the path within the store, OPTIONAL. Three states are distinguished
+  and all three are valid: ABSENT (a bare store URN), EMPTY (a trailing slash), and a
+  concrete path. The first two resolve to the §8.5 default view `index.html`, and
+  therefore derive the SAME key — a bare-store or trailing-slash URN is never rejected.
+- `?salt=<hex>` — OPTIONAL out-of-band private-store secret salt. NOT part of URN
+  identity, so it never enters `canonical()` (§3).
+
+### 2.1 The two layers, and why the same string parses differently at each
+
+The scheme has TWO parse layers. They are not rivals; comparing them as one is the
+source of every reported grammar contradiction.
+
+| layer | entry point | job | `?salt=` |
+|---|---|---|---|
+| **edge** | `ParsedUrn::parse` | split a USER-SUPPLIED string into `{urn, salt}` | PEELED off the tail |
+| **canonical** | `dig_urn_protocol::DigUrn::parse` | URN identity + key derivation | NOT special — literal resource bytes |
+
+A conforming implementation MUST peel the salt at the edge and MUST NOT peel it again at
+the canonical layer. Consequently the two layers derive DIFFERENT keys for a string
+carrying a `?salt=` tail, and identical keys for every string without one. The frozen
+conformance corpus is a CANONICAL-layer corpus: its `input` column is an already-peeled
+URN, which is why it pins `…/index.html?salt=deadbeef` as a resource path rather than a
+salt.
+
+### 2.2 Parse EXTRACTS, derive VALIDATES
+
+The edge parser MUST accept any non-empty hex run as the salt and MUST NOT enforce a
+length there. The 32-byte / 64-hex requirement is enforced where the salt becomes key
+material, and a violation MUST surface as a coded, catchable error (`ResolveError::Parse`)
+— never a panic and never an unhandled host exception. This is what makes an edge parser
+that accepts `?salt=aaaa` and a validator that requires 64 hex both correct: they are
+speaking about different layers.
 
 Parsing MUST reuse the canonical `dig-urn-protocol` URN parser
-(`DigUrn::parse_with_salt`) for the `urn:dig:<chain>:<store>[:<root>]/<key>[?salt=<hex>]`
-scheme — the single source of truth for the grammar, pinned by the frozen conformance
-corpus (`dig-urn-protocol/tests/fixtures/urn_conformance.json`). A syntactically invalid
-URN MUST produce a hard parse error.
+(`DigUrn::parse_with_salt`) — the single source of truth for the grammar within this
+crate, pinned by the frozen conformance corpus vendored at
+`tests/fixtures/urn_conformance.json` (a byte-mirror of
+`dig-urn-protocol/tests/fixtures/urn_conformance.json`; its vector rows are pinned by
+SHA-256 digest so a local edit fails loudly instead of diverging silently). A
+syntactically invalid URN MUST produce a hard parse error.
 
 ## 3. Keys (reused, root-independent)
 
